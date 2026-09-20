@@ -1,0 +1,47 @@
+__include__:
+  - './rtdetrv2_r18vd_120e_coco.yml'
+
+task: detection
+output_dir: /root/zxy/TCRA-SAR/experiments/msar_rtdetrv2_r18_120e_baseline_gpu01
+
+criterion: RTDETRCriterionv2
+num_classes: 4
+remap_mscoco_category: False
+
+PResNet:
+  depth: 18
+  freeze_at: -1
+  freeze_norm: False
+  pretrained: True
+
+train_dataloader:
+  dataset:
+    type: CocoDetection
+    img_folder: /root/zxy/TCRA-SAR/datasets/MSAR-1.0 dataset
+    ann_file: /root/zxy/TCRA-SAR/datasets/MSAR-1.0 dataset/RTDETR_COCO/train.json
+    remap_mscoco_category: False
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+  collate_fn:
+    scales: ~
+  total_batch_size: 16
+  num_workers: 4
+
+val_dataloader:
+  dataset:
+    type: CocoDetection
+    img_folder: /root/zxy/TCRA-SAR/datasets/MSAR-1.0 dataset
+    ann_file: /root/zxy/TCRA-SAR/datasets/MSAR-1.0 dataset/RTDETR_COCO/val.json
+    remap_mscoco_category: False
+    transforms:
+      ops:
+        - {type: Resize, size: [640, 640]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+  total_batch_size: 16
+  num_workers: 4

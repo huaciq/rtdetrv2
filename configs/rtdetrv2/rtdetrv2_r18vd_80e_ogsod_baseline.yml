@@ -1,0 +1,78 @@
+__include__:
+  - './rtdetrv2_r18vd_120e_coco.yml'
+
+task: detection
+output_dir: /root/zxy/TCRA-SAR/experiments/ogsod_rtdetrv2_r18_80e_baseline_gbs32_gpu23
+
+criterion: RTDETRCriterionv2
+num_classes: 3
+remap_mscoco_category: False
+
+PResNet:
+  depth: 18
+  freeze_at: -1
+  freeze_norm: False
+  pretrained: True
+
+train_dataloader:
+  dataset:
+    type: CocoDetection
+    img_folder: /root/zxy/TCRA-SAR/datasets/OGSOD-1.0/sar
+    ann_file: /root/zxy/TCRA-SAR/datasets/OGSOD-1.0/sar/RTDETR_COCO/train.json
+    return_masks: False
+    remap_mscoco_category: False
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        name: stop_epoch
+        epoch: 78
+        ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
+  collate_fn:
+    scales: ~
+    stop_epoch: 47
+  total_batch_size: 32
+  num_workers: 4
+
+val_dataloader:
+  dataset:
+    type: CocoDetection
+    img_folder: /root/zxy/TCRA-SAR/datasets/OGSOD-1.0/sar
+    ann_file: /root/zxy/TCRA-SAR/datasets/OGSOD-1.0/sar/RTDETR_COCO/val.json
+    return_masks: False
+    remap_mscoco_category: False
+    transforms:
+      ops:
+        - {type: Resize, size: [640, 640]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+  total_batch_size: 16
+  num_workers: 4
+
+epoches: 80
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*norm).*$'
+      lr: 0.00002
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.0002
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [67]
+  gamma: 0.1
+
+lr_warmup_scheduler:
+  type: LinearWarmup
+  warmup_duration: 2000

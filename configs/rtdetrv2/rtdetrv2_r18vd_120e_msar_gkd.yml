@@ -1,0 +1,60 @@
+__include__:
+  - './rtdetrv2_r18vd_120e_coco.yml'
+
+task: detection
+output_dir: /root/zxy/TCRA-SAR/experiments/msar_rtdetrv2_r18_120e_gkd05_gpu01
+
+criterion: MSARRTDETRCriterionv2
+num_classes: 4
+remap_mscoco_category: False
+
+PResNet:
+  depth: 18
+  freeze_at: -1
+  freeze_norm: False
+  pretrained: True
+
+MSARRTDETRCriterionv2:
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2}
+  losses: ['vfl', 'boxes']
+  alpha: 0.75
+  gamma: 2.0
+  kd_weight: 0.5
+  tau_q: 1.0
+  matcher:
+    type: HungarianMatcher
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
+    alpha: 0.25
+    gamma: 2.0
+
+train_dataloader:
+  dataset:
+    type: MSARTeacherCocoDetection
+    img_folder: /root/zxy/TCRA-SAR/datasets/MSAR-1.0 dataset
+    ann_file: /root/zxy/TCRA-SAR/datasets/MSAR-1.0 dataset/RTDETR_COCO/train.json
+    teacher_cache_dir: /root/zxy/TCRA-SAR/audits/msar_teacher_whole_train_20260915/vit_l_14_model_prompt7
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+  collate_fn:
+    scales: ~
+  total_batch_size: 16
+  num_workers: 4
+
+val_dataloader:
+  dataset:
+    type: CocoDetection
+    img_folder: /root/zxy/TCRA-SAR/datasets/MSAR-1.0 dataset
+    ann_file: /root/zxy/TCRA-SAR/datasets/MSAR-1.0 dataset/RTDETR_COCO/val.json
+    remap_mscoco_category: False
+    transforms:
+      ops:
+        - {type: Resize, size: [640, 640]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+  total_batch_size: 16
+  num_workers: 4

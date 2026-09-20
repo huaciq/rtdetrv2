@@ -1,0 +1,44 @@
+__include__: [
+  '../dataset/coco_detection.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/rtdetrv2_r50vd.yml',
+]
+
+output_dir: /root/zxy/ai_scientific_research/experiments/20260601-1859-rs-detr-vlp-dino-r50-dior-hrsc-baseline/rtdetrv2_r50vd_dior_full_e50_b8_gpu2_zxy
+use_ema: False
+epoches: 50
+
+num_classes: 20
+remap_mscoco_category: False
+
+train_dataloader:
+  dataset:
+    img_folder: /root/zxy/ai_scientific_research/datasets/dior/coco_hf_rtdetrv2/train2017/
+    ann_file: /root/zxy/ai_scientific_research/datasets/dior/coco_hf_rtdetrv2/annotations/instances_train2017.json
+  total_batch_size: 8
+  num_workers: 4
+
+val_dataloader:
+  dataset:
+    img_folder: /root/zxy/ai_scientific_research/datasets/dior/coco_hf_rtdetrv2/val2017/
+    ann_file: /root/zxy/ai_scientific_research/datasets/dior/coco_hf_rtdetrv2/annotations/instances_val2017.json
+  total_batch_size: 8
+  num_workers: 4
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*norm).*$'
+      lr: 0.00001
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+PResNet:
+  pretrained: False

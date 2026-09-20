@@ -1,0 +1,93 @@
+__include__:
+  - './rtdetrv2_r18vd_120e_coco.yml'
+
+task: detection
+output_dir: /root/zxy/TCRA-SAR/experiments/ogsod_rtdetrv2_r18_80e_gkd5_gbs32_gpu01
+
+criterion: MSARRTDETRCriterionv2
+num_classes: 3
+remap_mscoco_category: False
+
+PResNet:
+  depth: 18
+  freeze_at: -1
+  freeze_norm: False
+  pretrained: True
+
+MSARRTDETRCriterionv2:
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2}
+  losses: ['vfl', 'boxes']
+  alpha: 0.75
+  gamma: 2.0
+  kd_weight: 5.0
+  tau_q: 1.0
+  grad_norm_interval: 200
+  matcher:
+    type: HungarianMatcher
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
+    alpha: 0.25
+    gamma: 2.0
+
+train_dataloader:
+  dataset:
+    type: MSARTeacherCocoDetection
+    img_folder: /root/zxy/TCRA-SAR/datasets/OGSOD-1.0/sar
+    ann_file: /root/zxy/TCRA-SAR/datasets/OGSOD-1.0/sar/RTDETR_COCO/train.json
+    teacher_cache_dir: /root/zxy/TCRA-SAR/cache/teacher_whole/ogsod_1.0/vit_l_14_model_ogsod_prompt7/train
+    return_masks: False
+    remap_mscoco_category: False
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        name: stop_epoch
+        epoch: 78
+        ops: ['RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop']
+  collate_fn:
+    scales: ~
+    stop_epoch: 47
+  total_batch_size: 32
+  num_workers: 4
+
+val_dataloader:
+  dataset:
+    type: CocoDetection
+    img_folder: /root/zxy/TCRA-SAR/datasets/OGSOD-1.0/sar
+    ann_file: /root/zxy/TCRA-SAR/datasets/OGSOD-1.0/sar/RTDETR_COCO/val.json
+    return_masks: False
+    remap_mscoco_category: False
+    transforms:
+      ops:
+        - {type: Resize, size: [640, 640]}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+  total_batch_size: 16
+  num_workers: 4
+
+epoches: 80
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*norm).*$'
+      lr: 0.00002
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.0002
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [67]
+  gamma: 0.1
+
+lr_warmup_scheduler:
+  type: LinearWarmup
+  warmup_duration: 2000
