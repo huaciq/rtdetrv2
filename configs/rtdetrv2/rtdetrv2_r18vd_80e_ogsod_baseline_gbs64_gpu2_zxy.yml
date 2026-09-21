@@ -1,0 +1,43 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_baseline.yml'
+
+# OGSOD-1.0 SAR baseline: 2 x RTX 3090, global batch size 64.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_80e_baseline_gbs64_gpu2_zxy
+
+train_dataloader:
+  dataset:
+    img_folder: /home/zxy/sar/datasets/OGSOD-1.0/sar
+    ann_file: /home/zxy/sar/datasets/OGSOD-1.0/sar/RTDETR_COCO/train.json
+  total_batch_size: 64
+
+val_dataloader:
+  dataset:
+    img_folder: /home/zxy/sar/datasets/OGSOD-1.0/sar
+    ann_file: /home/zxy/sar/datasets/OGSOD-1.0/sar/RTDETR_COCO/val.json
+  total_batch_size: 32
+
+epoches: 80
+
+# Linear scaling from the GBS 32 baseline (2e-4 / 2e-5).
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*norm).*$'
+      lr: 0.00004
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.0004
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [67]
+  gamma: 0.1
+
+# GBS doubles the per-epoch step reduction; keep warmup at ~4.4 epochs.
+lr_warmup_scheduler:
+  type: LinearWarmup
+  warmup_duration: 1000
