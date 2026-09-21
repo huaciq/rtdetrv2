@@ -9,12 +9,14 @@ train_dataloader:
     img_folder: /home/zxy/sar/datasets/OGSOD-1.0/sar
     ann_file: /home/zxy/sar/datasets/OGSOD-1.0/sar/RTDETR_COCO/train.json
   total_batch_size: 64
+  num_workers: 2
 
 val_dataloader:
   dataset:
     img_folder: /home/zxy/sar/datasets/OGSOD-1.0/sar
     ann_file: /home/zxy/sar/datasets/OGSOD-1.0/sar/RTDETR_COCO/val.json
   total_batch_size: 32
+  num_workers: 2
 
 epoches: 80
 

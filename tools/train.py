@@ -6,6 +6,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 import argparse
+import torch.multiprocessing as mp
 
 from src.misc import dist_utils
 from src.core import YAMLConfig, yaml_utils
@@ -15,6 +16,13 @@ from src.solver import TASKS
 def main(args, ) -> None:
     """main
     """
+    # Linux DataLoader workers can exhaust a low per-process file-descriptor
+    # limit when the default file_descriptor tensor sharing strategy is used.
+    # file_system uses shared-memory names instead and is safe for this host's
+    # generously sized /dev/shm.
+    if sys.platform.startswith('linux') and 'file_system' in mp.get_all_sharing_strategies():
+        mp.set_sharing_strategy('file_system')
+
     dist_utils.setup_distributed(args.print_rank, args.print_method, seed=args.seed)
 
     assert not all([args.tuning, args.resume]), \
