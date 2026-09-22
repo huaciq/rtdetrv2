@@ -172,7 +172,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, data_loader, coco_evaluator: CocoEvaluator, device):
+def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
+             data_loader, coco_evaluator: CocoEvaluator, device,
+             query_diagnosis_output_dir=None):
     model.eval()
     criterion.eval()
     coco_evaluator.cleanup()
@@ -192,8 +194,11 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
         if 'enc_topk_boxes' in outputs:
             if dist_utils.get_world_size() == 1:
                 if query_stats is None:
-                    query_stats = QueryStats()
-                query_stats.update(outputs, targets, samples.shape[-2:])
+                    query_stats = QueryStats(query_diagnosis_output_dir)
+                diagnostic_images = (
+                    samples if query_diagnosis_output_dir is not None else None)
+                query_stats.update(
+                    outputs, targets, samples.shape[-2:], diagnostic_images)
             elif not query_stats_skipped:
                 print('Encoder Top-K Query Diagnosis skipped: '
                       'the first implementation supports single-GPU evaluation only.')
