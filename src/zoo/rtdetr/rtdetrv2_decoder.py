@@ -502,8 +502,19 @@ class RTDETRTransformerv2(nn.Module):
         enc_outputs_coord_unact :torch.Tensor = self.enc_bbox_head(output_memory) + anchors
 
         enc_topk_bboxes_list, enc_topk_logits_list = [], []
-        enc_topk_memory, enc_topk_logits, enc_topk_bbox_unact = \
+        enc_topk_memory, enc_topk_logits, enc_topk_bbox_unact, enc_topk_indices = \
             self._select_topk(output_memory, enc_outputs_logits, enc_outputs_coord_unact, self.num_queries)
+
+        encoder_query_diagnosis = None
+        if not self.training:
+            encoder_query_diagnosis = {
+                # Encoder proposals are normalized CXCYWH after sigmoid.
+                'enc_topk_boxes': enc_topk_bbox_unact.sigmoid(),
+                'enc_topk_logits': enc_topk_logits,
+                'enc_topk_indices': enc_topk_indices,
+                'enc_spatial_shapes': torch.as_tensor(
+                    spatial_shapes, dtype=torch.long, device=memory.device),
+            }
             
         if self.training:
             enc_topk_bboxes = F.sigmoid(enc_topk_bbox_unact)
@@ -524,7 +535,8 @@ class RTDETRTransformerv2(nn.Module):
             enc_topk_bbox_unact = torch.concat([denoising_bbox_unact, enc_topk_bbox_unact], dim=1)
             content = torch.concat([denoising_logits, content], dim=1)
         
-        return content, enc_topk_bbox_unact, enc_topk_bboxes_list, enc_topk_logits_list
+        return (content, enc_topk_bbox_unact, enc_topk_bboxes_list,
+                enc_topk_logits_list, encoder_query_diagnosis)
 
     def _select_topk(self, memory: torch.Tensor, outputs_logits: torch.Tensor, outputs_coords_unact: torch.Tensor, topk: int):
         if self.query_select_method == 'default':
@@ -548,7 +560,7 @@ class RTDETRTransformerv2(nn.Module):
         topk_memory = memory.gather(dim=1, \
             index=topk_ind.unsqueeze(-1).repeat(1, 1, memory.shape[-1]))
 
-        return topk_memory, topk_logits, topk_coords
+        return topk_memory, topk_logits, topk_coords, topk_ind
 
 
     def forward(self, feats, targets=None):
@@ -568,7 +580,8 @@ class RTDETRTransformerv2(nn.Module):
         else:
             denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
 
-        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
+        (init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list,
+         enc_topk_logits_list, encoder_query_diagnosis) = \
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
@@ -587,6 +600,9 @@ class RTDETRTransformerv2(nn.Module):
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
 
         out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+
+        if not self.training:
+            out.update(encoder_query_diagnosis)
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])

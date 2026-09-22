@@ -17,6 +17,7 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
+from .query_stats import QueryStats
 
 
 def optimized_loss(loss_dict):
@@ -179,12 +180,24 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
 
     metric_logger = MetricLogger(delimiter="  ")
     header = 'Test:'
+    query_stats = None
+    query_stats_skipped = False
     
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
+
+        if 'enc_topk_boxes' in outputs:
+            if dist_utils.get_world_size() == 1:
+                if query_stats is None:
+                    query_stats = QueryStats()
+                query_stats.update(outputs, targets, samples.shape[-2:])
+            elif not query_stats_skipped:
+                print('Encoder Top-K Query Diagnosis skipped: '
+                      'the first implementation supports single-GPU evaluation only.')
+                query_stats_skipped = True
 
         # TODO (lyuwenyu), fix dataset converted using `convert_to_coco_api`?
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
@@ -209,6 +222,9 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
     if coco_evaluator is not None:
         coco_evaluator.accumulate()
         coco_evaluator.summarize()
+
+    if query_stats is not None:
+        query_stats.summarize()
 
     stats = {}
     # stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
