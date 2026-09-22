@@ -8,7 +8,10 @@ from ..zoo.rtdetr.box_ops import box_cxcywh_to_xyxy, box_iou
 class QueryStats:
     """Accumulate encoder-query coverage statistics for single-process eval."""
 
-    IOU_THRESHOLDS = (0.1, 0.3, 0.5)
+    IOU_THRESHOLDS = (0.1, 0.3, 0.5, 0.75, 0.9)
+    TOP_N = (10, 20, 50, 100, 150, 300)
+    TOP_N_IOU_THRESHOLDS = (0.3, 0.5, 0.75)
+    CLASS_AWARE_IOU_THRESHOLDS = (0.3, 0.5, 0.75)
     SCORE_THRESHOLDS = (0.1, 0.3, 0.5)
     SCALE_NAMES = ('all', 'small', 'medium', 'large')
 
@@ -24,7 +27,23 @@ class QueryStats:
         self.high_conf_background = {
             threshold: 0 for threshold in self.SCORE_THRESHOLDS
         }
+        self.topn_recalled = {
+            n: {
+                threshold: {name: 0 for name in self.SCALE_NAMES}
+                for threshold in self.TOP_N_IOU_THRESHOLDS
+            }
+            for n in self.TOP_N
+        }
+        self.class_aware_recalled = {
+            threshold: {name: 0 for name in self.SCALE_NAMES}
+            for threshold in self.CLASS_AWARE_IOU_THRESHOLDS
+        }
+        self.best_ranks = {name: [] for name in self.SCALE_NAMES}
+        self.topn_background = {n: 0 for n in self.TOP_N}
+        self.topn_query_counts = {n: 0 for n in self.TOP_N}
         self.level_counts = None
+        self.topn_level_counts = None
+        self.best_level_counts = None
         self.spatial_shapes = None
 
     @staticmethod
@@ -83,11 +102,23 @@ class QueryStats:
             raise ValueError('enc_spatial_shapes must have shape [num_levels, 2]')
         if len(targets) != topk_boxes.shape[0]:
             raise ValueError('Target batch size does not match encoder diagnostics')
+        if topk_boxes.shape[1] < self.TOP_N[-1]:
+            raise ValueError(
+                f'QueryStats requires at least Top-{self.TOP_N[-1]} queries, '
+                f'got {topk_boxes.shape[1]}')
 
         shapes = spatial_shapes.detach().cpu().long()
         if self.spatial_shapes is None:
             self.spatial_shapes = shapes
             self.level_counts = torch.zeros(len(shapes), dtype=torch.long)
+            self.topn_level_counts = {
+                n: torch.zeros(len(shapes), dtype=torch.long)
+                for n in self.TOP_N
+            }
+            self.best_level_counts = {
+                name: torch.zeros(len(shapes), dtype=torch.long)
+                for name in self.SCALE_NAMES
+            }
         elif not torch.equal(self.spatial_shapes, shapes):
             raise ValueError(
                 f'Encoder spatial shapes changed during evaluation: '
@@ -97,25 +128,43 @@ class QueryStats:
         if topk_indices.numel() and topk_indices.max() >= level_ends[-1]:
             raise ValueError('enc_topk_indices contains an out-of-range flattened index')
         levels = torch.bucketize(topk_indices.contiguous(), level_ends, right=True)
+        levels = levels[:, :self.TOP_N[-1]]
         self.level_counts += torch.bincount(
             levels.flatten().cpu(), minlength=len(shapes))
+        for n in self.TOP_N:
+            self.topn_level_counts[n] += torch.bincount(
+                levels[:, :n].flatten().cpu(), minlength=len(shapes))
 
-        query_scores = topk_logits.sigmoid().max(dim=-1).values
-        topk_xyxy = box_cxcywh_to_xyxy(topk_boxes.float())
+        query_scores = topk_logits[:, :self.TOP_N[-1]].sigmoid().max(dim=-1).values
+        query_classes = topk_logits[:, :self.TOP_N[-1]].argmax(dim=-1)
+        topk_xyxy = box_cxcywh_to_xyxy(
+            topk_boxes[:, :self.TOP_N[-1]].float())
 
         for batch_index, target in enumerate(targets):
             gt_xyxy = self._normalized_gt_xyxy(target, image_hw)
             areas = self._target_areas(target, gt_xyxy)
+            labels = target['labels'].as_subclass(torch.Tensor).long()
             num_queries = topk_xyxy.shape[1]
             self.query_count += num_queries
+
+            if labels.shape[0] != gt_xyxy.shape[0]:
+                raise ValueError('Target labels and boxes must have the same length')
+            if labels.numel() and (labels.min() < 0 or labels.max() >= topk_logits.shape[-1]):
+                raise ValueError(
+                    'Target labels are not valid encoder-logit indices: '
+                    f'range [{labels.min().item()}, {labels.max().item()}], '
+                    f'num_classes={topk_logits.shape[-1]}')
 
             if gt_xyxy.numel() == 0:
                 query_best_iou = topk_xyxy.new_zeros(num_queries)
                 gt_best_iou = topk_xyxy.new_zeros(0)
+                gt_best_query_indices = torch.empty(
+                    0, dtype=torch.long, device=topk_xyxy.device)
+                ious = topk_xyxy.new_zeros((num_queries, 0))
             else:
                 ious, _ = box_iou(topk_xyxy[batch_index], gt_xyxy)
                 query_best_iou = ious.max(dim=1).values
-                gt_best_iou = ious.max(dim=0).values
+                gt_best_iou, gt_best_query_indices = ious.max(dim=0)
 
             for threshold in self.IOU_THRESHOLDS:
                 self.foreground[threshold] += int(
@@ -127,7 +176,40 @@ class QueryStats:
                 self.high_conf_background[threshold] += int(
                     ((scores >= threshold) & background).sum().item())
 
-            for scale_name, mask in self._scale_masks(areas).items():
+            for n in self.TOP_N:
+                self.topn_background[n] += int(
+                    (query_best_iou[:n] < 0.1).sum().item())
+                self.topn_query_counts[n] += n
+
+            scale_masks = self._scale_masks(areas)
+            for n in self.TOP_N:
+                if gt_xyxy.numel() == 0:
+                    topn_gt_best_iou = gt_best_iou
+                else:
+                    topn_gt_best_iou = ious[:n].max(dim=0).values
+                for threshold in self.TOP_N_IOU_THRESHOLDS:
+                    for scale_name, mask in scale_masks.items():
+                        self.topn_recalled[n][threshold][scale_name] += int(
+                            (topn_gt_best_iou[mask] >= threshold).sum().item())
+
+            if gt_xyxy.numel():
+                class_matches = (
+                    query_classes[batch_index, :, None] == labels[None, :])
+                for threshold in self.CLASS_AWARE_IOU_THRESHOLDS:
+                    recalled = ((ious >= threshold) & class_matches).any(dim=0)
+                    for scale_name, mask in scale_masks.items():
+                        self.class_aware_recalled[threshold][scale_name] += int(
+                            recalled[mask].sum().item())
+
+                ranks = gt_best_query_indices + 1
+                best_levels = levels[batch_index, gt_best_query_indices]
+                for scale_name, mask in scale_masks.items():
+                    self.best_ranks[scale_name].extend(
+                        ranks[mask].detach().cpu().tolist())
+                    self.best_level_counts[scale_name] += torch.bincount(
+                        best_levels[mask].detach().cpu(), minlength=len(shapes))
+
+            for scale_name, mask in scale_masks.items():
                 count = int(mask.sum().item())
                 self.gt_counts[scale_name] += count
                 if count == 0:
@@ -142,6 +224,16 @@ class QueryStats:
     def _ratio(numerator, denominator):
         return numerator / denominator if denominator else 0.0
 
+    @staticmethod
+    def _rank_summary(ranks):
+        if not ranks:
+            return 0.0, 0.0, 0.0, 0.0
+        values = torch.tensor(ranks, dtype=torch.float64)
+        quantiles = torch.quantile(values, torch.tensor(
+            [0.5, 0.75, 0.9], dtype=torch.float64))
+        return (values.mean().item(), quantiles[0].item(),
+                quantiles[1].item(), quantiles[2].item())
+
     def summarize(self):
         print('\nEncoder Top-K Query Diagnosis\n')
         print('GT counts:')
@@ -150,10 +242,37 @@ class QueryStats:
 
         print('\nQuery Recall:')
         for threshold in self.IOU_THRESHOLDS:
-            print(f'IoU >= {threshold:.1f}')
+            print(f'IoU >= {threshold:g}')
             for name in self.SCALE_NAMES:
                 value = self._ratio(
                     self.recalled[threshold][name], self.gt_counts[name])
+                print(f'{name}: {value:.6f}')
+
+        print('\nTop-N Query Recall Curve:')
+        for n in self.TOP_N:
+            print(f'Top{n}:')
+            for threshold in self.TOP_N_IOU_THRESHOLDS:
+                print(f'  QR@IoU={threshold:.2f}')
+                for name in self.SCALE_NAMES:
+                    value = self._ratio(
+                        self.topn_recalled[n][threshold][name],
+                        self.gt_counts[name])
+                    print(f'  {name}: {value:.6f}')
+
+        print('\nBest Query Rank:')
+        for name in self.SCALE_NAMES:
+            mean, median, p75, p90 = self._rank_summary(
+                self.best_ranks[name])
+            print(f'{name}: mean={mean:.3f}, median={median:.3f}, '
+                  f'P75={p75:.3f}, P90={p90:.3f}')
+
+        print('\nClass-aware Query Recall:')
+        for threshold in self.CLASS_AWARE_IOU_THRESHOLDS:
+            print(f'IoU >= {threshold:.2f}')
+            for name in self.SCALE_NAMES:
+                value = self._ratio(
+                    self.class_aware_recalled[threshold][name],
+                    self.gt_counts[name])
                 print(f'{name}: {value:.6f}')
 
         print('\nMean Best Query IoU:')
@@ -164,7 +283,7 @@ class QueryStats:
         print('\nSelected Query Foreground Ratio:')
         for threshold in self.IOU_THRESHOLDS:
             value = self._ratio(self.foreground[threshold], self.query_count)
-            print(f'IoU >= {threshold:.1f}: {value:.6f}')
+            print(f'IoU >= {threshold:g}: {value:.6f}')
 
         print('\nHigh-confidence non-GT queries:')
         for threshold in self.SCORE_THRESHOLDS:
@@ -172,9 +291,35 @@ class QueryStats:
                 self.high_conf_background[threshold], self.query_count)
             print(f'score >= {threshold:.1f} & IoU < 0.1: {value:.6f}')
 
+        print('\nTop-N Background Occupancy (max IoU < 0.1):')
+        for n in self.TOP_N:
+            count = self.topn_background[n]
+            value = self._ratio(count, self.topn_query_counts[n])
+            print(f'Top{n}: {count} ({value:.6f})')
+
         print('\nQuery source levels:')
         if self.level_counts is not None:
             for level, count_tensor in enumerate(self.level_counts):
                 count = int(count_tensor.item())
                 value = self._ratio(count, self.query_count)
                 print(f'P{level + 3}: {count} ({value:.6f})')
+
+        print('\nTop-N Feature Level Distribution:')
+        if self.topn_level_counts is not None:
+            for n in self.TOP_N:
+                print(f'Top{n}:')
+                total = int(self.topn_level_counts[n].sum().item())
+                for level, count_tensor in enumerate(self.topn_level_counts[n]):
+                    count = int(count_tensor.item())
+                    value = self._ratio(count, total)
+                    print(f'  P{level + 3}: {count} ({value:.6f})')
+
+        print('\nBest-matching Query Level by GT Size:')
+        if self.best_level_counts is not None:
+            for name in ('small', 'medium', 'large'):
+                print(f'{name}:')
+                total = int(self.best_level_counts[name].sum().item())
+                for level, count_tensor in enumerate(self.best_level_counts[name]):
+                    count = int(count_tensor.item())
+                    value = self._ratio(count, total)
+                    print(f'  P{level + 3}: {count} ({value:.6f})')
