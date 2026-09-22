@@ -32,7 +32,9 @@ class RTDETRCriterionv2(nn.Module):
         gamma=2.0, 
         num_classes=80, 
         boxes_weight_format=None,
-        share_matched_indices=False):
+        share_matched_indices=False,
+        quality_loss_topk=900,
+        quality_pos_weight=4.0):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -51,6 +53,52 @@ class RTDETRCriterionv2(nn.Module):
         self.share_matched_indices = share_matched_indices
         self.alpha = alpha
         self.gamma = gamma
+        if quality_loss_topk <= 0:
+            raise ValueError('quality_loss_topk must be positive')
+        self.quality_loss_topk = quality_loss_topk
+        self.quality_pos_weight = quality_pos_weight
+
+    def loss_quality(self, outputs, targets):
+        """Supervise encoder quality with detached max IoU to any GT box."""
+        quality_logits = outputs['enc_quality_logits'].squeeze(-1)
+        encoder_boxes = outputs['enc_quality_boxes']
+        class_logits = outputs['enc_quality_class_logits']
+
+        if quality_logits.shape != encoder_boxes.shape[:2]:
+            raise ValueError(
+                'Encoder quality logits and boxes must share shape [B, N]')
+        if class_logits.shape[:2] != encoder_boxes.shape[:2]:
+            raise ValueError(
+                'Encoder class logits and quality boxes must share shape [B, N]')
+
+        num_candidates = quality_logits.shape[1]
+        topk = min(self.quality_loss_topk, num_candidates)
+        # Sampling is deliberately based only on the original classification score.
+        class_scores = class_logits.sigmoid().amax(dim=-1)
+        sample_indices = torch.topk(class_scores, topk, dim=1).indices
+        sampled_logits = quality_logits.gather(1, sample_indices)
+
+        with torch.no_grad():
+            detached_boxes = encoder_boxes.detach()
+            quality_targets = []
+            for boxes, target in zip(detached_boxes, targets):
+                target_boxes = target['boxes'].to(
+                    device=boxes.device, dtype=boxes.dtype)
+                if target_boxes.numel() == 0:
+                    max_iou = boxes.new_zeros(boxes.shape[0])
+                else:
+                    ious, _ = box_iou(
+                        box_cxcywh_to_xyxy(boxes),
+                        box_cxcywh_to_xyxy(target_boxes))
+                    max_iou = ious.max(dim=1).values
+                quality_targets.append(max_iou)
+            quality_targets = torch.stack(quality_targets).detach()
+            sampled_targets = quality_targets.gather(1, sample_indices)
+
+        element_loss = F.binary_cross_entropy_with_logits(
+            sampled_logits, sampled_targets, reduction='none')
+        weights = 1.0 + self.quality_pos_weight * sampled_targets
+        return {'loss_quality': (weights * element_loss).mean()}
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -163,6 +211,15 @@ class RTDETRCriterionv2(nn.Module):
             l_dict = self.get_loss(loss, outputs, targets, indices, num_boxes, **meta)
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
+
+        if ('enc_quality_logits' in outputs
+                and 'loss_quality' in self.weight_dict):
+            quality_losses = self.loss_quality(outputs, targets)
+            losses.update({
+                key: value * self.weight_dict[key]
+                for key, value in quality_losses.items()
+                if key in self.weight_dict
+            })
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:

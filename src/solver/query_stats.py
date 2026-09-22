@@ -21,6 +21,13 @@ class QueryStats:
     SCORE_THRESHOLDS = (0.1, 0.3, 0.5)
     SCALE_NAMES = ('all', 'small', 'medium', 'large')
     BACKGROUND_IOU_THRESHOLD = 0.1
+    QUALITY_IOU_BINS = (
+        ('IoU < 0.1', 0.0, 0.1),
+        ('0.1 <= IoU < 0.3', 0.1, 0.3),
+        ('0.3 <= IoU < 0.5', 0.3, 0.5),
+        ('0.5 <= IoU < 0.75', 0.5, 0.75),
+        ('IoU >= 0.75', 0.75, None),
+    )
     VISUALIZATION_LIMIT = 50
 
     def __init__(self, output_dir=None, visualization_seed=0):
@@ -57,6 +64,11 @@ class QueryStats:
         self.correlation_chunks = {
             name: {'scores': [], 'ious': []}
             for name in self.SCALE_NAMES
+        }
+        self.quality_correlation_chunks = {'scores': [], 'ious': []}
+        self.quality_iou_bins = {
+            label: {'quality_sum': 0.0, 'count': 0}
+            for label, _, _ in self.QUALITY_IOU_BINS
         }
         self.gt_query_comparison = {
             name: {
@@ -269,6 +281,7 @@ class QueryStats:
         topk_logits = outputs['enc_topk_logits']
         topk_indices = outputs['enc_topk_indices']
         spatial_shapes = outputs['enc_spatial_shapes']
+        topk_quality_logits = outputs.get('enc_topk_quality_logits')
 
         if topk_boxes.ndim != 3 or topk_boxes.shape[-1] != 4:
             raise ValueError(f'enc_topk_boxes must have shape [B, K, 4], got {topk_boxes.shape}')
@@ -276,6 +289,10 @@ class QueryStats:
             raise ValueError('enc_topk_logits and enc_topk_boxes must share [B, K]')
         if topk_indices.shape != topk_boxes.shape[:2]:
             raise ValueError('enc_topk_indices must have shape [B, K]')
+        if (topk_quality_logits is not None
+                and topk_quality_logits.shape != (*topk_boxes.shape[:2], 1)):
+            raise ValueError(
+                'enc_topk_quality_logits must have shape [B, K, 1]')
         if spatial_shapes.ndim != 2 or spatial_shapes.shape[-1] != 2:
             raise ValueError('enc_spatial_shapes must have shape [num_levels, 2]')
         if len(targets) != topk_boxes.shape[0]:
@@ -374,6 +391,23 @@ class QueryStats:
                             image_scores[matched_scale].detach().float().cpu())
                         self.correlation_chunks[scale_name]['ious'].append(
                             query_best_iou[matched_scale].detach().float().cpu())
+
+            if topk_quality_logits is not None:
+                predicted_quality = topk_quality_logits[
+                    batch_index, :num_queries, 0].sigmoid()
+                self.quality_correlation_chunks['scores'].append(
+                    predicted_quality.detach().float().cpu())
+                self.quality_correlation_chunks['ious'].append(
+                    query_best_iou.detach().float().cpu())
+                for label, lower, upper in self.QUALITY_IOU_BINS:
+                    mask = query_best_iou >= lower
+                    if upper is not None:
+                        mask &= query_best_iou < upper
+                    count = int(mask.sum().item())
+                    if count:
+                        self.quality_iou_bins[label]['quality_sum'] += \
+                            predicted_quality[mask].sum().item()
+                        self.quality_iou_bins[label]['count'] += count
 
             for threshold in self.IOU_THRESHOLDS:
                 self.foreground[threshold] += int(
@@ -552,6 +586,24 @@ class QueryStats:
             print(f'{name}{suffix} (n={count}):')
             print(f'  Pearson: {self._format_metric(pearson)}')
             print(f'  Spearman: {self._format_metric(spearman)}')
+
+        if self.quality_correlation_chunks['scores']:
+            count, pearson, spearman = self._correlations(
+                self.quality_correlation_chunks['scores'],
+                self.quality_correlation_chunks['ious'])
+            print('\nQuality-IoU Correlation:')
+            print(f'n={count}')
+            print(f'  Pearson: {self._format_metric(pearson)}')
+            print(f'  Spearman: {self._format_metric(spearman)}')
+            print('\nPredicted Quality by True Max-IoU Bin:')
+            for label, _, _ in self.QUALITY_IOU_BINS:
+                bucket = self.quality_iou_bins[label]
+                mean_quality = self._ratio(
+                    bucket['quality_sum'], bucket['count'])
+                formatted_mean = (
+                    f'{mean_quality:.6f}' if bucket['count'] else 'N/A')
+                print(f'{label}: mean predicted quality={formatted_mean}, '
+                      f"n={bucket['count']}")
 
         print('\nGT Best-IoU Query vs Highest-Score Overlapping Query:')
         for name in ('small', 'medium', 'large'):

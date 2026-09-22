@@ -1,0 +1,16 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_baseline_gbs64_gpu2_zxy.yml'
+
+# QAQS-only experiment. All data, optimization, augmentation, and schedule
+# settings are inherited unchanged from the GBS64 two-GPU OGSOD baseline.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_80e_qaqs_gbs64_gpu2_zxy
+
+RTDETRTransformerv2:
+  query_select_method: quality
+  quality_alpha: 1.0
+  quality_beta: 1.0
+
+RTDETRCriterionv2:
+  quality_loss_topk: 900
+  quality_pos_weight: 4.0
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_quality: 1.0}
