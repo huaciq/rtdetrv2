@@ -210,7 +210,12 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
         # TODO (lyuwenyu), fix dataset converted using `convert_to_coco_api`?
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         
-        if getattr(postprocessor, 'oracle_final_iou_gamma', 0.0) != 0.0:
+        oracle_enabled = (
+            getattr(postprocessor, 'oracle_final_iou_gamma', 0.0) != 0.0
+            or getattr(
+                postprocessor,
+                'class_aware_oracle_final_iou_gamma', 0.0) != 0.0)
+        if oracle_enabled:
             results = postprocessor(
                 outputs, orig_target_sizes, targets=targets,
                 image_hw=samples.shape[-2:])

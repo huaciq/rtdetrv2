@@ -35,6 +35,7 @@ class RTDETRPostProcessor(nn.Module):
         remap_mscoco_category=False,
         final_quality_gamma=0.0,
         oracle_final_iou_gamma=0.0,
+        class_aware_oracle_final_iou_gamma=0.0,
     ) -> None:
         super().__init__()
         self.use_focal_loss = use_focal_loss
@@ -43,11 +44,17 @@ class RTDETRPostProcessor(nn.Module):
         self.remap_mscoco_category = remap_mscoco_category 
         self.final_quality_gamma = float(final_quality_gamma)
         self.oracle_final_iou_gamma = float(oracle_final_iou_gamma)
-        if (self.final_quality_gamma != 0.0
-                and self.oracle_final_iou_gamma != 0.0):
+        self.class_aware_oracle_final_iou_gamma = float(
+            class_aware_oracle_final_iou_gamma)
+        active_rerankers = sum(gamma != 0.0 for gamma in (
+            self.final_quality_gamma,
+            self.oracle_final_iou_gamma,
+            self.class_aware_oracle_final_iou_gamma,
+        ))
+        if active_rerankers > 1:
             raise ValueError(
-                'Learned-quality and oracle-quality re-ranking are mutually '
-                'exclusive diagnostics')
+                'Learned-quality and oracle re-ranking modes are mutually '
+                'exclusive')
         self.deploy_mode = False 
 
     def extra_repr(self) -> str:
@@ -55,7 +62,9 @@ class RTDETRPostProcessor(nn.Module):
                 f'num_classes={self.num_classes}, '
                 f'num_top_queries={self.num_top_queries}, '
                 f'final_quality_gamma={self.final_quality_gamma}, '
-                f'oracle_final_iou_gamma={self.oracle_final_iou_gamma}')
+                f'oracle_final_iou_gamma={self.oracle_final_iou_gamma}, '
+                'class_aware_oracle_final_iou_gamma='
+                f'{self.class_aware_oracle_final_iou_gamma}')
     
     # def forward(self, outputs, orig_target_sizes):
     def forward(self, outputs, orig_target_sizes: torch.Tensor,
@@ -65,7 +74,11 @@ class RTDETRPostProcessor(nn.Module):
 
         bbox_pred = torchvision.ops.box_convert(boxes, in_fmt='cxcywh', out_fmt='xyxy')
         oracle_quality = None
-        if self.oracle_final_iou_gamma != 0.0:
+        class_aware_oracle_quality = None
+        oracle_enabled = (
+            self.oracle_final_iou_gamma != 0.0
+            or self.class_aware_oracle_final_iou_gamma != 0.0)
+        if oracle_enabled:
             if not self.use_focal_loss:
                 raise ValueError(
                     'Oracle final-IoU re-ranking requires focal-loss scores')
@@ -78,7 +91,14 @@ class RTDETRPostProcessor(nn.Module):
             image_h, image_w = image_hw
             input_scale = bbox_pred.new_tensor(
                 [image_w, image_h, image_w, image_h])
-            oracle_quality = logits.new_zeros(logits.shape)
+            if self.oracle_final_iou_gamma != 0.0:
+                # Existing query-class oracle: one quality per class score.
+                oracle_quality = logits.new_zeros(logits.shape)
+            else:
+                # Strict requested oracle: one predicted-class quality per query.
+                class_aware_oracle_quality = logits.new_zeros(
+                    (*logits.shape[:2], 1))
+                predicted_classes = logits.argmax(dim=-1)
             for batch_index, target in enumerate(targets):
                 target_boxes = target['boxes'].as_subclass(torch.Tensor).to(
                     device=bbox_pred.device, dtype=bbox_pred.dtype)
@@ -93,13 +113,25 @@ class RTDETRPostProcessor(nn.Module):
                 target_boxes = target_boxes / input_scale
                 ious = torchvision.ops.box_iou(
                     bbox_pred[batch_index].float(), target_boxes.float())
-                for class_id in target_labels.unique().tolist():
-                    if class_id < 0 or class_id >= self.num_classes:
-                        raise ValueError(
-                            f'GT class {class_id} is outside model class range')
-                    class_mask = target_labels == class_id
-                    oracle_quality[batch_index, :, class_id] = \
-                        ious[:, class_mask].max(dim=1).values.to(logits.dtype)
+                if self.oracle_final_iou_gamma != 0.0:
+                    for class_id in target_labels.unique().tolist():
+                        if class_id < 0 or class_id >= self.num_classes:
+                            raise ValueError(
+                                f'GT class {class_id} is outside model class range')
+                        class_mask = target_labels == class_id
+                        oracle_quality[batch_index, :, class_id] = \
+                            ious[:, class_mask].max(dim=1).values.to(logits.dtype)
+                else:
+                    image_predicted_classes = predicted_classes[batch_index]
+                    for class_id in image_predicted_classes.unique().tolist():
+                        class_mask = target_labels == class_id
+                        if not class_mask.any():
+                            continue
+                        query_mask = image_predicted_classes == class_id
+                        class_aware_oracle_quality[
+                            batch_index, query_mask, 0] = ious[
+                                query_mask][:, class_mask].max(
+                                    dim=1).values.to(logits.dtype)
         bbox_pred *= orig_target_sizes.repeat(1, 2).unsqueeze(1)
 
         if self.use_focal_loss:
@@ -118,6 +150,9 @@ class RTDETRPostProcessor(nn.Module):
             elif self.oracle_final_iou_gamma != 0.0:
                 scores = scores * oracle_quality.pow(
                     self.oracle_final_iou_gamma)
+            elif self.class_aware_oracle_final_iou_gamma != 0.0:
+                scores = scores * class_aware_oracle_quality.pow(
+                    self.class_aware_oracle_final_iou_gamma)
             scores, index = torch.topk(scores.flatten(1), self.num_top_queries, dim=-1)
             # TODO for older tensorrt
             # labels = index % self.num_classes

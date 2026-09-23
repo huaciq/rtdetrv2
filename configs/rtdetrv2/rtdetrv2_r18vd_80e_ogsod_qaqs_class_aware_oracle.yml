@@ -1,0 +1,9 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_qaqs_gbs64_gpu2_zxy.yml'
+
+# ORACLE DIAGNOSTIC ONLY: for each query, use max IoU to GT objects
+# matching argmax(final_logits), then broadcast that scalar to all class scores.
+RTDETRPostProcessor:
+  final_quality_gamma: 0.0
+  oracle_final_iou_gamma: 0.0
+  class_aware_oracle_final_iou_gamma: 0.0
