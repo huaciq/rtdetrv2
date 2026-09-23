@@ -1,0 +1,8 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_qaqs_gbs64_gpu2_zxy.yml'
+
+# ORACLE DIAGNOSTIC ONLY: uses validation GT to re-rank final predictions.
+# This is not deployable model performance. Override gamma at test time.
+RTDETRPostProcessor:
+  final_quality_gamma: 0.0
+  oracle_final_iou_gamma: 0.0

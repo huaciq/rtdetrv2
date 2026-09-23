@@ -67,7 +67,13 @@ class QueryStats:
             name: {'scores': [], 'ious': []}
             for name in self.SCALE_NAMES
         }
-        self.quality_correlation_chunks = {'scores': [], 'ious': []}
+        self.quality_correlation_chunks = {
+            name: {
+                'encoder_scores': [], 'encoder_ious': [],
+                'final_scores': [], 'final_ious': [],
+            }
+            for name in self.SCALE_NAMES
+        }
         self.quality_iou_bins = {
             label: {'quality_sum': 0.0, 'count': 0}
             for label, _, _ in self.QUALITY_IOU_BINS
@@ -348,6 +354,17 @@ class QueryStats:
         query_classes = topk_logits[:, :self.TOP_N[-1]].argmax(dim=-1)
         topk_xyxy = box_cxcywh_to_xyxy(
             topk_boxes[:, :self.TOP_N[-1]].float())
+        final_xyxy = None
+        if topk_quality_logits is not None:
+            if 'pred_boxes' not in outputs:
+                raise KeyError(
+                    'Final decoder boxes are required for quality diagnostics')
+            final_boxes = outputs['pred_boxes']
+            if final_boxes.shape != topk_boxes.shape:
+                raise ValueError(
+                    'Final decoder boxes and selected encoder queries must '
+                    'share shape [B, Q, 4]; query order cannot be audited')
+            final_xyxy = box_cxcywh_to_xyxy(final_boxes.float())
 
         for batch_index, target in enumerate(targets):
             gt_xyxy = self._normalized_gt_xyxy(target, image_hw)
@@ -367,16 +384,24 @@ class QueryStats:
 
             if gt_xyxy.numel() == 0:
                 query_best_iou = topk_xyxy.new_zeros(num_queries)
+                final_query_best_iou = topk_xyxy.new_zeros(num_queries)
                 gt_best_iou = topk_xyxy.new_zeros(0)
                 gt_best_query_indices = torch.empty(
                     0, dtype=torch.long, device=topk_xyxy.device)
                 query_best_gt_indices = torch.empty(
+                    num_queries, dtype=torch.long, device=topk_xyxy.device)
+                final_best_gt_indices = torch.empty(
                     num_queries, dtype=torch.long, device=topk_xyxy.device)
                 ious = topk_xyxy.new_zeros((num_queries, 0))
             else:
                 ious, _ = box_iou(topk_xyxy[batch_index], gt_xyxy)
                 query_best_iou, query_best_gt_indices = ious.max(dim=1)
                 gt_best_iou, gt_best_query_indices = ious.max(dim=0)
+                if final_xyxy is not None:
+                    final_ious, _ = box_iou(
+                        final_xyxy[batch_index], gt_xyxy)
+                    final_query_best_iou, final_best_gt_indices = \
+                        final_ious.max(dim=1)
 
             image_scores = query_scores[batch_index]
             self.correlation_chunks['all']['scores'].append(
@@ -398,10 +423,37 @@ class QueryStats:
             if topk_quality_logits is not None:
                 predicted_quality = topk_quality_logits[
                     batch_index, :num_queries, 0].sigmoid()
-                self.quality_correlation_chunks['scores'].append(
+                quality_all = self.quality_correlation_chunks['all']
+                quality_all['encoder_scores'].append(
                     predicted_quality.detach().float().cpu())
-                self.quality_correlation_chunks['ious'].append(
+                quality_all['encoder_ious'].append(
                     query_best_iou.detach().float().cpu())
+                quality_all['final_scores'].append(
+                    predicted_quality.detach().float().cpu())
+                quality_all['final_ious'].append(
+                    final_query_best_iou.detach().float().cpu())
+                if gt_xyxy.numel():
+                    encoder_positive = query_best_iou > 0
+                    final_positive = final_query_best_iou > 0
+                    for scale_name in ('small', 'medium', 'large'):
+                        quality_group = self.quality_correlation_chunks[
+                            scale_name]
+                        encoder_mask = (
+                            scale_masks[scale_name][query_best_gt_indices]
+                            & encoder_positive)
+                        final_mask = (
+                            scale_masks[scale_name][final_best_gt_indices]
+                            & final_positive)
+                        if encoder_mask.any():
+                            quality_group['encoder_scores'].append(
+                                predicted_quality[encoder_mask].detach().float().cpu())
+                            quality_group['encoder_ious'].append(
+                                query_best_iou[encoder_mask].detach().float().cpu())
+                        if final_mask.any():
+                            quality_group['final_scores'].append(
+                                predicted_quality[final_mask].detach().float().cpu())
+                            quality_group['final_ious'].append(
+                                final_query_best_iou[final_mask].detach().float().cpu())
                 for label, lower, upper in self.QUALITY_IOU_BINS:
                     mask = query_best_iou >= lower
                     if upper is not None:
@@ -617,14 +669,49 @@ class QueryStats:
             print(f'  Pearson: {self._format_metric(pearson)}')
             print(f'  Spearman: {self._format_metric(spearman)}')
 
-        if self.quality_correlation_chunks['scores']:
-            count, pearson, spearman = self._correlations(
-                self.quality_correlation_chunks['scores'],
-                self.quality_correlation_chunks['ious'])
-            print('\nQuality-IoU Correlation:')
-            print(f'n={count}')
-            print(f'  Pearson: {self._format_metric(pearson)}')
-            print(f'  Spearman: {self._format_metric(spearman)}')
+        quality_alignment = {}
+        if self.quality_correlation_chunks['all']['encoder_scores']:
+            print('\nEncoder Quality vs Encoder/Final IoU Correlation:')
+            for name in self.SCALE_NAMES:
+                chunks = self.quality_correlation_chunks[name]
+                enc_count, enc_pearson, enc_spearman = self._correlations(
+                    chunks['encoder_scores'], chunks['encoder_ious'])
+                final_count, final_pearson, final_spearman = self._correlations(
+                    chunks['final_scores'], chunks['final_ious'])
+                suffix = '' if name == 'all' else ' (best-matched, IoU > 0)'
+                print(f'{name}{suffix}:')
+                print(f'  encoder IoU (n={enc_count}): '
+                      f'Pearson={self._format_metric(enc_pearson)}, '
+                      f'Spearman={self._format_metric(enc_spearman)}')
+                print(f'  final IoU (n={final_count}): '
+                      f'Pearson={self._format_metric(final_pearson)}, '
+                      f'Spearman={self._format_metric(final_spearman)}')
+                quality_alignment[name] = {
+                    'encoder_iou': {
+                        'sample_count': enc_count,
+                        'pearson': enc_pearson,
+                        'spearman': enc_spearman,
+                    },
+                    'final_iou': {
+                        'sample_count': final_count,
+                        'pearson': final_pearson,
+                        'spearman': final_spearman,
+                    },
+                }
+            if self.output_dir is not None:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                quality_path = self.output_dir / 'encoder_quality_alignment.json'
+                with quality_path.open('w', encoding='utf-8') as file:
+                    json.dump({
+                        'query_order': (
+                            'selected encoder query i is paired with final '
+                            'decoder query i'),
+                        'scale_grouping': (
+                            'each stage uses the size of its max-IoU matched '
+                            'GT; size groups exclude zero-overlap queries'),
+                        'correlations': quality_alignment,
+                    }, file, indent=2)
+                print(f'  JSON: {quality_path}')
             print('\nPredicted Quality by True Max-IoU Bin:')
             for label, _, _ in self.QUALITY_IOU_BINS:
                 bucket = self.quality_iou_bins[label]
