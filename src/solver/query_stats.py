@@ -30,8 +30,10 @@ class QueryStats:
     )
     VISUALIZATION_LIMIT = 50
 
-    def __init__(self, output_dir=None, visualization_seed=0):
+    def __init__(self, output_dir=None, visualization_seed=0,
+                 final_quality_gamma=0.0):
         self.output_dir = Path(output_dir) if output_dir is not None else None
+        self.final_quality_gamma = final_quality_gamma
         self.visualization_rng = random.Random(visualization_seed)
         self.visualization_candidate_count = 0
         self.visualization_samples = []
@@ -70,6 +72,7 @@ class QueryStats:
             label: {'quality_sum': 0.0, 'count': 0}
             for label, _, _ in self.QUALITY_IOU_BINS
         }
+        self.final_score_chunks = {'scores': [], 'ious': []}
         self.gt_query_comparison = {
             name: {
                 'best_iou': {
@@ -504,6 +507,33 @@ class QueryStats:
                     self.recalled[threshold][scale_name] += int(
                         (selected_best_iou >= threshold).sum().item())
 
+    def update_final_predictions(self, results, targets, image_hw):
+        """Accumulate final prediction score vs class-agnostic max GT IoU."""
+        if len(results) != len(targets):
+            raise ValueError('Prediction and target batch sizes must match')
+
+        for result, target in zip(results, targets):
+            scores = result['scores'].detach().float()
+            boxes = result['boxes'].detach().float()
+            if boxes.ndim != 2 or boxes.shape[-1] != 4:
+                raise ValueError('Final prediction boxes must have shape [K, 4]')
+            if scores.shape != boxes.shape[:1]:
+                raise ValueError('Final prediction scores must have shape [K]')
+
+            orig_size = target['orig_size'].to(
+                device=boxes.device, dtype=boxes.dtype)
+            pred_xyxy = boxes / orig_size.repeat(2)
+            gt_xyxy = self._normalized_gt_xyxy(target, image_hw)
+            if gt_xyxy.numel() == 0:
+                max_iou = scores.new_zeros(scores.shape)
+            else:
+                ious, _ = box_iou(pred_xyxy, gt_xyxy)
+                max_iou = ious.max(dim=1).values
+
+            self.final_score_chunks['scores'].append(scores.cpu())
+            self.final_score_chunks['ious'].append(
+                max_iou.detach().float().cpu())
+
     @staticmethod
     def _ratio(numerator, denominator):
         return numerator / denominator if denominator else 0.0
@@ -604,6 +634,29 @@ class QueryStats:
                     f'{mean_quality:.6f}' if bucket['count'] else 'N/A')
                 print(f'{label}: mean predicted quality={formatted_mean}, '
                       f"n={bucket['count']}")
+
+        if self.final_score_chunks['scores']:
+            count, pearson, spearman = self._correlations(
+                self.final_score_chunks['scores'],
+                self.final_score_chunks['ious'])
+            print('\nFinal Prediction Score-IoU Correlation:')
+            print(f'gamma={self.final_quality_gamma:g}, n={count}')
+            print(f'  Pearson: {self._format_metric(pearson)}')
+            print(f'  Spearman: {self._format_metric(spearman)}')
+            if self.output_dir is not None:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                alignment_path = self.output_dir / 'final_score_alignment.json'
+                with alignment_path.open('w', encoding='utf-8') as file:
+                    json.dump({
+                        'final_quality_gamma': self.final_quality_gamma,
+                        'sample_count': count,
+                        'pearson': pearson,
+                        'spearman': spearman,
+                        'iou_definition': (
+                            'class-agnostic max IoU between each final '
+                            'prediction and all GT boxes in the image'),
+                    }, file, indent=2)
+                print(f'  JSON: {alignment_path}')
 
         print('\nGT Best-IoU Query vs Highest-Score Overlapping Query:')
         for name in ('small', 'medium', 'large'):

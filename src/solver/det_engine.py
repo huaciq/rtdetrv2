@@ -194,7 +194,10 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
         if 'enc_topk_boxes' in outputs:
             if dist_utils.get_world_size() == 1:
                 if query_stats is None:
-                    query_stats = QueryStats(query_diagnosis_output_dir)
+                    query_stats = QueryStats(
+                        query_diagnosis_output_dir,
+                        final_quality_gamma=getattr(
+                            postprocessor, 'final_quality_gamma', 0.0))
                 diagnostic_images = (
                     samples if query_diagnosis_output_dir is not None else None)
                 query_stats.update(
@@ -208,6 +211,9 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         
         results = postprocessor(outputs, orig_target_sizes)
+        if query_stats is not None:
+            query_stats.update_final_predictions(
+                results, targets, samples.shape[-2:])
 
         # if 'segm' in postprocessor.keys():
         #     target_sizes = torch.stack([t["size"] for t in targets], dim=0)

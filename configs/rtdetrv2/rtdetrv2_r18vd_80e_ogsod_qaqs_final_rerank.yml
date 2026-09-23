@@ -1,0 +1,6 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_qaqs_gbs64_gpu2_zxy.yml'
+
+# Inference-only final score re-ranking. Override this value at test time.
+RTDETRPostProcessor:
+  final_quality_gamma: 0.0

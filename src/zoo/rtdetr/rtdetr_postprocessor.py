@@ -32,17 +32,22 @@ class RTDETRPostProcessor(nn.Module):
         num_classes=80, 
         use_focal_loss=True, 
         num_top_queries=300, 
-        remap_mscoco_category=False
+        remap_mscoco_category=False,
+        final_quality_gamma=0.0,
     ) -> None:
         super().__init__()
         self.use_focal_loss = use_focal_loss
         self.num_top_queries = num_top_queries
         self.num_classes = int(num_classes)
         self.remap_mscoco_category = remap_mscoco_category 
+        self.final_quality_gamma = float(final_quality_gamma)
         self.deploy_mode = False 
 
     def extra_repr(self) -> str:
-        return f'use_focal_loss={self.use_focal_loss}, num_classes={self.num_classes}, num_top_queries={self.num_top_queries}'
+        return (f'use_focal_loss={self.use_focal_loss}, '
+                f'num_classes={self.num_classes}, '
+                f'num_top_queries={self.num_top_queries}, '
+                f'final_quality_gamma={self.final_quality_gamma}')
     
     # def forward(self, outputs, orig_target_sizes):
     def forward(self, outputs, orig_target_sizes: torch.Tensor):
@@ -54,6 +59,17 @@ class RTDETRPostProcessor(nn.Module):
 
         if self.use_focal_loss:
             scores = F.sigmoid(logits)
+            if self.final_quality_gamma != 0.0:
+                if 'enc_topk_quality_logits' not in outputs:
+                    raise KeyError(
+                        'final_quality_gamma requires enc_topk_quality_logits')
+                quality_logits = outputs['enc_topk_quality_logits']
+                if quality_logits.shape != (*scores.shape[:2], 1):
+                    raise ValueError(
+                        'enc_topk_quality_logits must have shape [B, Q, 1] '
+                        'matching decoder predictions')
+                query_quality = quality_logits.sigmoid()
+                scores = scores * query_quality.pow(self.final_quality_gamma)
             scores, index = torch.topk(scores.flatten(1), self.num_top_queries, dim=-1)
             # TODO for older tensorrt
             # labels = index % self.num_classes

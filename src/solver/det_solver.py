@@ -128,5 +128,14 @@ class DetSolver(BaseSolver):
                 
         if self.output_dir:
             dist_utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")
+            if dist_utils.is_main_process() and 'coco_eval_bbox' in test_stats:
+                metric_names = (
+                    'AP', 'AP50', 'AP75', 'APs', 'APm', 'APl',
+                    'AR1', 'AR10', 'AR100', 'ARs', 'ARm', 'ARl')
+                metrics = dict(zip(
+                    metric_names, test_stats['coco_eval_bbox']))
+                with (self.output_dir / 'evaluation_metrics.json').open(
+                        'w', encoding='utf-8') as file:
+                    json.dump(metrics, file, indent=2)
         
         return
