@@ -250,11 +250,13 @@ class TransformerDecoder(nn.Module):
                 memory_spatial_shapes,
                 bbox_head,
                 score_head,
+                quality_head,
                 query_pos_head,
                 attn_mask=None,
                 memory_mask=None):
         dec_out_bboxes = []
         dec_out_logits = []
+        dec_out_quality_logits = []
         ref_points_detach = F.sigmoid(ref_points_unact)
 
         output = target
@@ -268,6 +270,8 @@ class TransformerDecoder(nn.Module):
 
             if self.training:
                 dec_out_logits.append(score_head[i](output))
+                if quality_head is not None:
+                    dec_out_quality_logits.append(quality_head[i](output))
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
                 else:
@@ -275,13 +279,19 @@ class TransformerDecoder(nn.Module):
 
             elif i == self.eval_idx:
                 dec_out_logits.append(score_head[i](output))
+                if quality_head is not None:
+                    dec_out_quality_logits.append(quality_head[i](output))
                 dec_out_bboxes.append(inter_ref_bbox)
                 break
 
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach()
 
-        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits)
+        quality_outputs = (
+            torch.stack(dec_out_quality_logits)
+            if dec_out_quality_logits else None)
+        return (torch.stack(dec_out_bboxes), torch.stack(dec_out_logits),
+                quality_outputs)
 
 
 @register()
@@ -312,7 +322,8 @@ class RTDETRTransformerv2(nn.Module):
                  cross_attn_method='default', 
                  query_select_method='default',
                  quality_alpha=1.0,
-                 quality_beta=1.0):
+                 quality_beta=1.0,
+                 decoder_quality=False):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -337,6 +348,7 @@ class RTDETRTransformerv2(nn.Module):
         self.query_select_method = query_select_method
         self.quality_alpha = quality_alpha
         self.quality_beta = quality_beta
+        self.decoder_quality = decoder_quality
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -385,6 +397,10 @@ class RTDETRTransformerv2(nn.Module):
         self.dec_bbox_head = nn.ModuleList([
             MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_layers)
         ])
+        if decoder_quality:
+            self.dec_quality_head = nn.ModuleList([
+                nn.Linear(hidden_dim, 1) for _ in range(num_layers)
+            ])
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -407,6 +423,10 @@ class RTDETRTransformerv2(nn.Module):
             init.constant_(_cls.bias, bias)
             init.constant_(_reg.layers[-1].weight, 0)
             init.constant_(_reg.layers[-1].bias, 0)
+        if self.decoder_quality:
+            for quality_head in self.dec_quality_head:
+                init.constant_(quality_head.weight, 0)
+                init.constant_(quality_head.bias, 0)
         
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learn_query_content:
@@ -629,21 +649,27 @@ class RTDETRTransformerv2(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits = self.decoder(
+        out_bboxes, out_logits, out_quality_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
             spatial_shapes,
             self.dec_bbox_head,
             self.dec_score_head,
+            self.dec_quality_head if self.decoder_quality else None,
             self.query_pos_head,
             attn_mask=attn_mask)
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
+            if out_quality_logits is not None:
+                _, out_quality_logits = torch.split(
+                    out_quality_logits, dn_meta['dn_num_split'], dim=2)
 
         out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+        if out_quality_logits is not None:
+            out['pred_quality_logits'] = out_quality_logits[-1]
 
         if self.training and encoder_quality_outputs is not None:
             out.update(encoder_quality_outputs)
@@ -652,7 +678,9 @@ class RTDETRTransformerv2(nn.Module):
             out.update(encoder_query_diagnosis)
 
         if self.training and self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])
+            out['aux_outputs'] = self._set_aux_loss(
+                out_logits[:-1], out_bboxes[:-1],
+                out_quality_logits[:-1] if out_quality_logits is not None else None)
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
 
@@ -664,9 +692,16 @@ class RTDETRTransformerv2(nn.Module):
 
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
+    def _set_aux_loss(self, outputs_class, outputs_coord,
+                      outputs_quality=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b}
-                for a, b in zip(outputs_class, outputs_coord)]
+        if outputs_quality is None:
+            return [{'pred_logits': a, 'pred_boxes': b}
+                    for a, b in zip(outputs_class, outputs_coord)]
+        return [
+            {'pred_logits': a, 'pred_boxes': b, 'pred_quality_logits': q}
+            for a, b, q in zip(
+                outputs_class, outputs_coord, outputs_quality)
+        ]

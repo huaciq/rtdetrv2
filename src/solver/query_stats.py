@@ -79,6 +79,11 @@ class QueryStats:
             for label, _, _ in self.QUALITY_IOU_BINS
         }
         self.final_score_chunks = {'scores': [], 'ious': []}
+        self.decoder_quality_chunks = {'scores': [], 'ious': []}
+        self.decoder_quality_iou_bins = {
+            label: {'quality_sum': 0.0, 'count': 0}
+            for label, _, _ in self.QUALITY_IOU_BINS
+        }
         self.gt_query_comparison = {
             name: {
                 'best_iou': {
@@ -291,6 +296,7 @@ class QueryStats:
         topk_indices = outputs['enc_topk_indices']
         spatial_shapes = outputs['enc_spatial_shapes']
         topk_quality_logits = outputs.get('enc_topk_quality_logits')
+        decoder_quality_logits = outputs.get('pred_quality_logits')
 
         if topk_boxes.ndim != 3 or topk_boxes.shape[-1] != 4:
             raise ValueError(f'enc_topk_boxes must have shape [B, K, 4], got {topk_boxes.shape}')
@@ -302,6 +308,11 @@ class QueryStats:
                 and topk_quality_logits.shape != (*topk_boxes.shape[:2], 1)):
             raise ValueError(
                 'enc_topk_quality_logits must have shape [B, K, 1]')
+        if (decoder_quality_logits is not None
+                and decoder_quality_logits.shape != (*topk_boxes.shape[:2], 1)):
+            raise ValueError(
+                'pred_quality_logits must have shape [B, K, 1] matching '
+                'selected encoder query order')
         if spatial_shapes.ndim != 2 or spatial_shapes.shape[-1] != 2:
             raise ValueError('enc_spatial_shapes must have shape [num_levels, 2]')
         if len(targets) != topk_boxes.shape[0]:
@@ -355,7 +366,8 @@ class QueryStats:
         topk_xyxy = box_cxcywh_to_xyxy(
             topk_boxes[:, :self.TOP_N[-1]].float())
         final_xyxy = None
-        if topk_quality_logits is not None:
+        if (topk_quality_logits is not None
+                or decoder_quality_logits is not None):
             if 'pred_boxes' not in outputs:
                 raise KeyError(
                     'Final decoder boxes are required for quality diagnostics')
@@ -463,6 +475,24 @@ class QueryStats:
                         self.quality_iou_bins[label]['quality_sum'] += \
                             predicted_quality[mask].sum().item()
                         self.quality_iou_bins[label]['count'] += count
+
+            if decoder_quality_logits is not None:
+                predicted_decoder_quality = decoder_quality_logits[
+                    batch_index, :num_queries, 0].sigmoid()
+                self.decoder_quality_chunks['scores'].append(
+                    predicted_decoder_quality.detach().float().cpu())
+                self.decoder_quality_chunks['ious'].append(
+                    final_query_best_iou.detach().float().cpu())
+                for label, lower, upper in self.QUALITY_IOU_BINS:
+                    mask = final_query_best_iou >= lower
+                    if upper is not None:
+                        mask &= final_query_best_iou < upper
+                    count = int(mask.sum().item())
+                    if count:
+                        bucket = self.decoder_quality_iou_bins[label]
+                        bucket['quality_sum'] += \
+                            predicted_decoder_quality[mask].sum().item()
+                        bucket['count'] += count
 
             for threshold in self.IOU_THRESHOLDS:
                 self.foreground[threshold] += int(
@@ -744,6 +774,46 @@ class QueryStats:
                             'prediction and all GT boxes in the image'),
                     }, file, indent=2)
                 print(f'  JSON: {alignment_path}')
+
+        if self.decoder_quality_chunks['scores']:
+            count, pearson, spearman = self._correlations(
+                self.decoder_quality_chunks['scores'],
+                self.decoder_quality_chunks['ious'])
+            print('\nPredicted Decoder Quality vs Final Bbox IoU:')
+            print(f'n={count}')
+            print(f'  Pearson: {self._format_metric(pearson)}')
+            print(f'  Spearman: {self._format_metric(spearman)}')
+            print('\nPredicted Decoder Quality by Final-IoU Bin:')
+            bins = {}
+            for label, _, _ in self.QUALITY_IOU_BINS:
+                bucket = self.decoder_quality_iou_bins[label]
+                mean_quality = self._ratio(
+                    bucket['quality_sum'], bucket['count'])
+                formatted_mean = (
+                    f'{mean_quality:.6f}' if bucket['count'] else 'N/A')
+                print(f'{label}: mean predicted quality={formatted_mean}, '
+                      f"n={bucket['count']}")
+                bins[label] = {
+                    'mean_predicted_quality': (
+                        mean_quality if bucket['count'] else None),
+                    'sample_count': bucket['count'],
+                }
+            if self.output_dir is not None:
+                self.output_dir.mkdir(parents=True, exist_ok=True)
+                decoder_quality_path = (
+                    self.output_dir / 'decoder_quality_alignment.json')
+                with decoder_quality_path.open(
+                        'w', encoding='utf-8') as file:
+                    json.dump({
+                        'sample_count': count,
+                        'pearson': pearson,
+                        'spearman': spearman,
+                        'iou_definition': (
+                            'class-agnostic max IoU between final decoder '
+                            'bbox and all GT boxes in the image'),
+                        'bins': bins,
+                    }, file, indent=2)
+                print(f'  JSON: {decoder_quality_path}')
 
         print('\nGT Best-IoU Query vs Highest-Score Overlapping Query:')
         for name in ('small', 'medium', 'large'):

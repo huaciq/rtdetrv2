@@ -100,6 +100,35 @@ class RTDETRCriterionv2(nn.Module):
         weights = 1.0 + self.quality_pos_weight * sampled_targets
         return {'loss_quality': (weights * element_loss).mean()}
 
+    def loss_decoder_quality(self, outputs, targets, indices):
+        """Supervise one decoder layer with its own matched-box IoU."""
+        quality_logits = outputs['pred_quality_logits'].squeeze(-1)
+        decoder_boxes = outputs['pred_boxes']
+        if quality_logits.shape != decoder_boxes.shape[:2]:
+            raise ValueError(
+                'Decoder quality logits and boxes must share shape [B, Q]')
+
+        with torch.no_grad():
+            quality_targets = torch.zeros_like(quality_logits)
+            for batch_index, (src_indices, target_indices) in enumerate(indices):
+                if src_indices.numel() == 0:
+                    continue
+                matched_boxes = decoder_boxes[
+                    batch_index, src_indices].detach()
+                matched_targets = targets[batch_index]['boxes'][
+                    target_indices].to(
+                        device=matched_boxes.device,
+                        dtype=matched_boxes.dtype)
+                ious, _ = box_iou(
+                    box_cxcywh_to_xyxy(matched_boxes),
+                    box_cxcywh_to_xyxy(matched_targets))
+                quality_targets[batch_index, src_indices] = \
+                    torch.diag(ious).detach()
+
+        loss = F.binary_cross_entropy_with_logits(
+            quality_logits, quality_targets, reduction='mean')
+        return {'loss_decoder_quality': loss}
+
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
@@ -221,6 +250,16 @@ class RTDETRCriterionv2(nn.Module):
                 if key in self.weight_dict
             })
 
+        if ('pred_quality_logits' in outputs
+                and 'loss_decoder_quality' in self.weight_dict):
+            decoder_quality_losses = self.loss_decoder_quality(
+                outputs, targets, indices)
+            losses.update({
+                key: value * self.weight_dict[key]
+                for key, value in decoder_quality_losses.items()
+                if key in self.weight_dict
+            })
+
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
@@ -233,6 +272,23 @@ class RTDETRCriterionv2(nn.Module):
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f'_aux_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+                if ('pred_quality_logits' in aux_outputs
+                        and 'loss_decoder_quality' in self.weight_dict):
+                    quality_indices = indices
+                    if self.share_matched_indices:
+                        quality_indices = self.matcher(
+                            aux_outputs, targets)['indices']
+                    quality_losses = self.loss_decoder_quality(
+                        aux_outputs, targets, quality_indices)
+                    quality_losses = {
+                        key: value * self.weight_dict[key]
+                        for key, value in quality_losses.items()
+                        if key in self.weight_dict
+                    }
+                    losses.update({
+                        key + f'_aux_{i}': value
+                        for key, value in quality_losses.items()
+                    })
 
         # In case of cdn auxiliary losses. For rtdetr
         if 'dn_aux_outputs' in outputs:

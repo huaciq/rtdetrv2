@@ -36,6 +36,8 @@ class RTDETRPostProcessor(nn.Module):
         final_quality_gamma=0.0,
         oracle_final_iou_gamma=0.0,
         class_aware_oracle_final_iou_gamma=0.0,
+        final_score_method='default',
+        decoder_quality_beta=1.0,
     ) -> None:
         super().__init__()
         self.use_focal_loss = use_focal_loss
@@ -46,11 +48,19 @@ class RTDETRPostProcessor(nn.Module):
         self.oracle_final_iou_gamma = float(oracle_final_iou_gamma)
         self.class_aware_oracle_final_iou_gamma = float(
             class_aware_oracle_final_iou_gamma)
+        if final_score_method not in ('default', 'decoder_quality'):
+            raise ValueError(
+                f'Unsupported final_score_method: {final_score_method}')
+        self.final_score_method = final_score_method
+        self.decoder_quality_beta = float(decoder_quality_beta)
         active_rerankers = sum(gamma != 0.0 for gamma in (
             self.final_quality_gamma,
             self.oracle_final_iou_gamma,
             self.class_aware_oracle_final_iou_gamma,
         ))
+        if (self.final_score_method == 'decoder_quality'
+                and self.decoder_quality_beta != 0.0):
+            active_rerankers += 1
         if active_rerankers > 1:
             raise ValueError(
                 'Learned-quality and oracle re-ranking modes are mutually '
@@ -64,7 +74,9 @@ class RTDETRPostProcessor(nn.Module):
                 f'final_quality_gamma={self.final_quality_gamma}, '
                 f'oracle_final_iou_gamma={self.oracle_final_iou_gamma}, '
                 'class_aware_oracle_final_iou_gamma='
-                f'{self.class_aware_oracle_final_iou_gamma}')
+                f'{self.class_aware_oracle_final_iou_gamma}, '
+                f'final_score_method={self.final_score_method}, '
+                f'decoder_quality_beta={self.decoder_quality_beta}')
     
     # def forward(self, outputs, orig_target_sizes):
     def forward(self, outputs, orig_target_sizes: torch.Tensor,
@@ -136,7 +148,21 @@ class RTDETRPostProcessor(nn.Module):
 
         if self.use_focal_loss:
             scores = F.sigmoid(logits)
-            if self.final_quality_gamma != 0.0:
+            if (self.final_score_method == 'decoder_quality'
+                    and self.decoder_quality_beta != 0.0):
+                if 'pred_quality_logits' not in outputs:
+                    raise KeyError(
+                        'decoder_quality scoring requires '
+                        'pred_quality_logits')
+                decoder_quality_logits = outputs['pred_quality_logits']
+                if decoder_quality_logits.shape != (*scores.shape[:2], 1):
+                    raise ValueError(
+                        'pred_quality_logits must have shape [B, Q, 1] '
+                        'matching decoder predictions')
+                decoder_quality = decoder_quality_logits.sigmoid()
+                scores = scores * decoder_quality.pow(
+                    self.decoder_quality_beta)
+            elif self.final_quality_gamma != 0.0:
                 if 'enc_topk_quality_logits' not in outputs:
                     raise KeyError(
                         'final_quality_gamma requires enc_topk_quality_logits')

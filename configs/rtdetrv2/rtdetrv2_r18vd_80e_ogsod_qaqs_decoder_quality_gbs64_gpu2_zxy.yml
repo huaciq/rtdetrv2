@@ -1,0 +1,22 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_qaqs_gbs64_gpu2_zxy.yml'
+
+# QAQS + progressive decoder localization-quality prediction.
+# All data, augmentation, optimization, and schedule settings are inherited.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_80e_qaqs_decoder_quality_gbs64_gpu2_zxy
+
+RTDETRTransformerv2:
+  decoder_quality: True
+
+RTDETRCriterionv2:
+  weight_dict: {
+    loss_vfl: 1,
+    loss_bbox: 5,
+    loss_giou: 2,
+    loss_quality: 1.0,
+    loss_decoder_quality: 1.0
+  }
+
+RTDETRPostProcessor:
+  final_score_method: decoder_quality
+  decoder_quality_beta: 1.0
