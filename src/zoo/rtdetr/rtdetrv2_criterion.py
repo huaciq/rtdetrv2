@@ -123,7 +123,9 @@ class RTDETRCriterionv2(nn.Module):
                     box_cxcywh_to_xyxy(matched_boxes),
                     box_cxcywh_to_xyxy(matched_targets))
                 quality_targets[batch_index, src_indices] = \
-                    torch.diag(ious).detach()
+                    torch.diag(ious).detach().to(
+                        device=quality_targets.device,
+                        dtype=quality_targets.dtype)
 
         loss = F.binary_cross_entropy_with_logits(
             quality_logits, quality_targets, reduction='mean')
