@@ -34,7 +34,8 @@ class RTDETRCriterionv2(nn.Module):
         boxes_weight_format=None,
         share_matched_indices=False,
         quality_loss_topk=900,
-        quality_pos_weight=4.0):
+        quality_pos_weight=4.0,
+        decoder_quality_loss_mode='all'):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -57,6 +58,10 @@ class RTDETRCriterionv2(nn.Module):
             raise ValueError('quality_loss_topk must be positive')
         self.quality_loss_topk = quality_loss_topk
         self.quality_pos_weight = quality_pos_weight
+        if decoder_quality_loss_mode not in ('all', 'positive'):
+            raise ValueError(
+                'decoder_quality_loss_mode must be all or positive')
+        self.decoder_quality_loss_mode = decoder_quality_loss_mode
 
     def loss_quality(self, outputs, targets):
         """Supervise encoder quality with detached max IoU to any GT box."""
@@ -107,6 +112,38 @@ class RTDETRCriterionv2(nn.Module):
         if quality_logits.shape != decoder_boxes.shape[:2]:
             raise ValueError(
                 'Decoder quality logits and boxes must share shape [B, Q]')
+
+        if self.decoder_quality_loss_mode == 'positive':
+            positive_logits = []
+            positive_targets = []
+            for batch_index, (src_indices, target_indices) in enumerate(indices):
+                if src_indices.numel() == 0:
+                    continue
+                positive_logits.append(
+                    quality_logits[batch_index, src_indices])
+                matched_boxes = decoder_boxes[
+                    batch_index, src_indices].detach()
+                matched_targets = targets[batch_index]['boxes'][
+                    target_indices].to(
+                        device=matched_boxes.device,
+                        dtype=matched_boxes.dtype)
+                ious, _ = box_iou(
+                    box_cxcywh_to_xyxy(matched_boxes),
+                    box_cxcywh_to_xyxy(matched_targets))
+                positive_targets.append(
+                    torch.diag(ious).detach().to(
+                        device=quality_logits.device,
+                        dtype=quality_logits.dtype))
+
+            if positive_logits:
+                loss = F.binary_cross_entropy_with_logits(
+                    torch.cat(positive_logits),
+                    torch.cat(positive_targets),
+                    reduction='mean')
+            else:
+                # Keep every quality head in the graph for empty-GT DDP batches.
+                loss = quality_logits.sum() * 0.0
+            return {'loss_decoder_quality': loss}
 
         with torch.no_grad():
             quality_targets = torch.zeros_like(quality_logits)

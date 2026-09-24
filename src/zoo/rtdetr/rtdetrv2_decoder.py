@@ -251,6 +251,7 @@ class TransformerDecoder(nn.Module):
                 bbox_head,
                 score_head,
                 quality_head,
+                quality_detach,
                 query_pos_head,
                 attn_mask=None,
                 memory_mask=None):
@@ -271,7 +272,9 @@ class TransformerDecoder(nn.Module):
             if self.training:
                 dec_out_logits.append(score_head[i](output))
                 if quality_head is not None:
-                    dec_out_quality_logits.append(quality_head[i](output))
+                    quality_input = output.detach() if quality_detach else output
+                    dec_out_quality_logits.append(
+                        quality_head[i](quality_input))
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
                 else:
@@ -280,7 +283,9 @@ class TransformerDecoder(nn.Module):
             elif i == self.eval_idx:
                 dec_out_logits.append(score_head[i](output))
                 if quality_head is not None:
-                    dec_out_quality_logits.append(quality_head[i](output))
+                    quality_input = output.detach() if quality_detach else output
+                    dec_out_quality_logits.append(
+                        quality_head[i](quality_input))
                 dec_out_bboxes.append(inter_ref_bbox)
                 break
 
@@ -323,7 +328,8 @@ class RTDETRTransformerv2(nn.Module):
                  query_select_method='default',
                  quality_alpha=1.0,
                  quality_beta=1.0,
-                 decoder_quality=False):
+                 decoder_quality=False,
+                 decoder_quality_detach=False):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -349,6 +355,7 @@ class RTDETRTransformerv2(nn.Module):
         self.quality_alpha = quality_alpha
         self.quality_beta = quality_beta
         self.decoder_quality = decoder_quality
+        self.decoder_quality_detach = decoder_quality_detach
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -657,6 +664,7 @@ class RTDETRTransformerv2(nn.Module):
             self.dec_bbox_head,
             self.dec_score_head,
             self.dec_quality_head if self.decoder_quality else None,
+            self.decoder_quality_detach,
             self.query_pos_head,
             attn_mask=attn_mask)
 
