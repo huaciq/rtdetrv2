@@ -945,11 +945,26 @@ class FinalQualityProbeStats:
     """Distributed-safe final quality/IoU diagnostics for probe training."""
 
     QUALITY_IOU_BINS = QueryStats.QUALITY_IOU_BINS
+    TOP_N = (10, 20, 50, 100)
+    IOU_CONDITIONS = (0.1, 0.3, 0.5, 0.75)
+    HIGH_IOU_BINS = (
+        ('0.5 <= IoU < 0.6', 0.5, 0.6),
+        ('0.6 <= IoU < 0.7', 0.6, 0.7),
+        ('0.7 <= IoU < 0.8', 0.7, 0.8),
+        ('0.8 <= IoU < 0.9', 0.8, 0.9),
+        ('0.9 <= IoU <= 1.0', 0.9, None),
+    )
+    PER_CLASS_TOPK = 100
 
     def __init__(self, output_dir=None):
         self.output_dir = Path(output_dir) if output_dir is not None else None
         self.scores = []
         self.ious = []
+        self.topn_chunks = {
+            topn: {'scores': [], 'ious': []} for topn in self.TOP_N
+        }
+        self.ranking_same = 0
+        self.ranking_regrets = []
 
     def update(self, outputs, targets, image_hw):
         quality_logits = outputs.get('pred_quality_logits')
@@ -983,21 +998,102 @@ class FinalQualityProbeStats:
                 pred_xyxy[batch_index],
                 target_labels,
                 target_boxes)
-            self.scores.append(
-                quality_logits[batch_index, :, 0].sigmoid().detach().float().cpu())
+            predicted_quality = quality_logits[
+                batch_index, :, 0].sigmoid().detach().float()
+            original_class_scores = class_logits[
+                batch_index].detach().sigmoid()
+            query_class_scores = original_class_scores.amax(dim=-1)
+            self.scores.append(predicted_quality.cpu())
             self.ious.append(true_quality.detach().float().cpu())
+
+            for topn in self.TOP_N:
+                count = min(topn, query_class_scores.numel())
+                indices = torch.topk(
+                    query_class_scores, count, dim=0).indices
+                self.topn_chunks[topn]['scores'].append(
+                    predicted_quality[indices].cpu())
+                self.topn_chunks[topn]['ious'].append(
+                    true_quality[indices].detach().float().cpu())
+
+            for class_id in target_labels.unique().tolist():
+                if class_id < 0 or class_id >= class_logits.shape[-1]:
+                    raise ValueError(
+                        f'GT class {class_id} is outside model class range')
+                class_gt_mask = target_labels == class_id
+                class_ious, _ = box_iou(
+                    pred_xyxy[batch_index],
+                    target_boxes[class_gt_mask])
+                class_true_iou = class_ious.max(dim=1).values
+                candidate_count = min(
+                    self.PER_CLASS_TOPK, class_true_iou.numel())
+                candidate_indices = torch.topk(
+                    original_class_scores[:, class_id],
+                    candidate_count, dim=0).indices
+                candidate_true_iou = class_true_iou[candidate_indices]
+                best_true_position = candidate_true_iou.argmax()
+                best_quality_position = predicted_quality[
+                    candidate_indices].argmax()
+                best_true_query = candidate_indices[best_true_position]
+                best_quality_query = candidate_indices[best_quality_position]
+                self.ranking_same += int(
+                    best_true_query.item() == best_quality_query.item())
+                regret = (
+                    candidate_true_iou[best_true_position]
+                    - candidate_true_iou[best_quality_position])
+                self.ranking_regrets.append(
+                    regret.clamp_min(0).detach().float().cpu().reshape(1))
 
     def synchronize_between_processes(self):
         scores = torch.cat(self.scores) if self.scores else torch.empty(0)
         ious = torch.cat(self.ious) if self.ious else torch.empty(0)
+        topn = {
+            key: (
+                torch.cat(chunks['scores'])
+                if chunks['scores'] else torch.empty(0),
+                torch.cat(chunks['ious'])
+                if chunks['ious'] else torch.empty(0),
+            )
+            for key, chunks in self.topn_chunks.items()
+        }
+        regrets = (
+            torch.cat(self.ranking_regrets)
+            if self.ranking_regrets else torch.empty(0))
+        ranking_same = self.ranking_same
         if (torch.distributed.is_available()
                 and torch.distributed.is_initialized()):
             gathered = [None] * torch.distributed.get_world_size()
-            torch.distributed.all_gather_object(gathered, (scores, ious))
+            payload = (scores, ious, topn, regrets, ranking_same)
+            torch.distributed.all_gather_object(gathered, payload)
             scores = torch.cat([item[0] for item in gathered])
             ious = torch.cat([item[1] for item in gathered])
+            topn = {
+                key: (
+                    torch.cat([item[2][key][0] for item in gathered]),
+                    torch.cat([item[2][key][1] for item in gathered]),
+                )
+                for key in self.TOP_N
+            }
+            regrets = torch.cat([item[3] for item in gathered])
+            ranking_same = sum(item[4] for item in gathered)
         self.scores = [scores]
         self.ious = [ious]
+        self.topn_chunks = {
+            key: {'scores': [values[0]], 'ious': [values[1]]}
+            for key, values in topn.items()
+        }
+        self.ranking_regrets = [regrets]
+        self.ranking_same = ranking_same
+
+    @staticmethod
+    def _correlation_summary(scores, ious):
+        count, pearson, spearman = QueryStats._correlations(
+            [scores] if scores.numel() else [],
+            [ious] if ious.numel() else [])
+        return {
+            'sample_count': count,
+            'pearson': pearson,
+            'spearman': spearman,
+        }
 
     def summarize(self, write_output=True, print_output=True):
         count, pearson, spearman = QueryStats._correlations(
@@ -1032,6 +1128,90 @@ class FinalQualityProbeStats:
                 'mean_true_iou': mean_true_iou,
             }
 
+        topn_correlations = {}
+        if print_output:
+            print('\nConditional Correlation by Original Classification Top-N:')
+        for topn in self.TOP_N:
+            topn_scores = torch.cat(self.topn_chunks[topn]['scores'])
+            topn_ious = torch.cat(self.topn_chunks[topn]['ious'])
+            correlation = self._correlation_summary(topn_scores, topn_ious)
+            topn_correlations[f'top{topn}'] = correlation
+            if print_output:
+                print(
+                    f'Top{topn} (n={correlation["sample_count"]}): '
+                    f'Pearson={QueryStats._format_metric(correlation["pearson"])}, '
+                    f'Spearman={QueryStats._format_metric(correlation["spearman"])}')
+
+        iou_condition_correlations = {}
+        if print_output:
+            print('\nConditional Correlation by True IoU Threshold:')
+        for threshold in self.IOU_CONDITIONS:
+            mask = ious > threshold
+            correlation = self._correlation_summary(
+                scores[mask], ious[mask])
+            key = f'IoU > {threshold:g}'
+            iou_condition_correlations[key] = correlation
+            if print_output:
+                print(
+                    f'{key} (n={correlation["sample_count"]}): '
+                    f'Pearson={QueryStats._format_metric(correlation["pearson"])}, '
+                    f'Spearman={QueryStats._format_metric(correlation["spearman"])}')
+
+        high_iou_bins = {}
+        if print_output:
+            print('\nHigh-IoU Quality Calibration Bins:')
+        for label, lower, upper in self.HIGH_IOU_BINS:
+            mask = ious >= lower
+            if upper is not None:
+                mask &= ious < upper
+            bucket_count = int(mask.sum().item())
+            mean_quality = (
+                float(scores[mask].mean().item()) if bucket_count else None)
+            mean_true_iou = (
+                float(ious[mask].mean().item()) if bucket_count else None)
+            high_iou_bins[label] = {
+                'sample_count': bucket_count,
+                'mean_predicted_quality': mean_quality,
+                'mean_true_iou': mean_true_iou,
+            }
+            if print_output:
+                quality_text = (
+                    f'{mean_quality:.6f}' if mean_quality is not None else 'N/A')
+                iou_text = (
+                    f'{mean_true_iou:.6f}' if mean_true_iou is not None else 'N/A')
+                print(f'{label}: mean predicted quality={quality_text}, '
+                      f'mean true IoU={iou_text}, n={bucket_count}')
+
+        regrets = (
+            torch.cat(self.ranking_regrets)
+            if self.ranking_regrets else torch.empty(0))
+        group_count = regrets.numel()
+        ranking = {
+            'image_class_group_count': group_count,
+            'same_query_count': self.ranking_same,
+            'same_query_rate': (
+                self.ranking_same / group_count if group_count else None),
+            'mean_iou_regret': (
+                float(regrets.mean().item()) if group_count else None),
+            'median_iou_regret': (
+                float(torch.quantile(regrets, 0.5).item())
+                if group_count else None),
+            'p90_iou_regret': (
+                float(torch.quantile(regrets, 0.9).item())
+                if group_count else None),
+            'candidate_definition': (
+                'for each image and each class present in GT, take the 100 '
+                'queries with highest sigmoid(class_logits[:, class_id])'),
+        }
+        if print_output:
+            print('\nPer-Image / Per-Class Top-100 Ranking Diagnosis:')
+            print(f'image-class groups: {group_count}')
+            if group_count:
+                print(f'same-query rate: {ranking["same_query_rate"]:.6f}')
+                print(f'mean IoU regret: {ranking["mean_iou_regret"]:.6f}')
+                print(f'median IoU regret: {ranking["median_iou_regret"]:.6f}')
+                print(f'P90 IoU regret: {ranking["p90_iou_regret"]:.6f}')
+
         summary = {
             'sample_count': count,
             'pearson': pearson,
@@ -1041,12 +1221,24 @@ class FinalQualityProbeStats:
                 'class equals argmax(detached final class logits); zero when '
                 'that predicted class has no GT'),
             'bins': bins,
+            'topn_classification_correlations': topn_correlations,
+            'iou_condition_correlations': iou_condition_correlations,
+            'high_iou_bins': high_iou_bins,
+            'per_image_per_class_ranking': ranking,
+            'topn_definition': (
+                'queries ranked by max_c sigmoid(detached final logits[i,c]); '
+                'quality/IoU correlation is then computed inside each subset'),
         }
         if write_output and self.output_dir is not None:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             output_path = self.output_dir / 'decoder_quality_alignment.json'
             with output_path.open('w', encoding='utf-8') as file:
                 json.dump(summary, file, indent=2)
+            diagnosis_path = (
+                self.output_dir / 'final_quality_probe_diagnosis.json')
+            with diagnosis_path.open('w', encoding='utf-8') as file:
+                json.dump(summary, file, indent=2)
             if print_output:
                 print(f'  JSON: {output_path}')
+                print(f'  JSON: {diagnosis_path}')
         return summary
