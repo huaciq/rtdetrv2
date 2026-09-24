@@ -39,6 +39,43 @@ def box_iou(boxes1: Tensor, boxes2: Tensor):
     return iou, union
 
 
+def predicted_class_max_iou(
+        pred_logits: Tensor,
+        pred_boxes_xyxy: Tensor,
+        target_labels: Tensor,
+        target_boxes_xyxy: Tensor) -> Tensor:
+    """Return each query's max IoU to GT of its predicted class.
+
+    This is the shared definition used by the predicted-class-aware oracle and
+    the final decoder quality probe target. Boxes must already use the same
+    XYXY coordinate system.
+    """
+    if pred_logits.ndim != 2:
+        raise ValueError('pred_logits must have shape [Q, C]')
+    if pred_boxes_xyxy.shape != (pred_logits.shape[0], 4):
+        raise ValueError('pred_boxes_xyxy must have shape [Q, 4]')
+    if target_boxes_xyxy.ndim != 2 or target_boxes_xyxy.shape[-1] != 4:
+        raise ValueError('target_boxes_xyxy must have shape [G, 4]')
+    if target_labels.ndim != 1 or target_labels.shape[0] != target_boxes_xyxy.shape[0]:
+        raise ValueError('target labels and boxes must have matching length')
+
+    quality = pred_boxes_xyxy.new_zeros(pred_logits.shape[0])
+    if target_boxes_xyxy.numel() == 0:
+        return quality
+
+    predicted_classes = pred_logits.argmax(dim=-1)
+    ious, _ = box_iou(
+        pred_boxes_xyxy.float(), target_boxes_xyxy.float())
+    for class_id in predicted_classes.unique().tolist():
+        target_mask = target_labels == class_id
+        if not target_mask.any():
+            continue
+        query_mask = predicted_classes == class_id
+        quality[query_mask] = ious[query_mask][:, target_mask].max(
+            dim=1).values.to(quality.dtype)
+    return quality
+
+
 def generalized_box_iou(boxes1, boxes2):
     """
     Generalized IoU from https://giou.stanford.edu/

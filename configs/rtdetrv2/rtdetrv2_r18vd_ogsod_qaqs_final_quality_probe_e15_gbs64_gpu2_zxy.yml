@@ -1,0 +1,49 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_qaqs_gbs64_gpu2_zxy.yml'
+
+# Probe-only experiment initialized with --tuning from the original QAQS best
+# checkpoint. The detector is frozen; only the final decoder quality MLP trains.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_qaqs_final_quality_probe_e15_gbs64_gpu2_zxy
+epoches: 15
+checkpoint_freq: 1
+checkpoint_metric: decoder_quality_correlation
+use_ema: False
+
+# The QAQS checkpoint supplies every detector weight.
+PResNet:
+  pretrained: False
+
+RTDETR:
+  freeze_detector_for_final_quality_probe: True
+
+RTDETRTransformerv2:
+  final_quality_probe: True
+
+RTDETRCriterionv2:
+  final_quality_probe: True
+  final_quality_probe_topk: 100
+  weight_dict:
+    loss_final_quality_probe: 1.0
+
+RTDETRPostProcessor:
+  final_score_method: decoder_quality
+  decoder_quality_beta: 0.0
+  decoder_quality_iou_mode: predicted_class
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: 'decoder.final_quality_probe_head'
+  lr: 0.001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [10]
+  gamma: 0.1
+
+lr_warmup_scheduler:
+  type: LinearWarmup
+  warmup_duration: 100

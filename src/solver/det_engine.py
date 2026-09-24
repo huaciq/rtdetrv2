@@ -17,7 +17,7 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
-from .query_stats import QueryStats
+from .query_stats import FinalQualityProbeStats, QueryStats
 
 
 def optimized_loss(loss_dict):
@@ -184,6 +184,11 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
     header = 'Test:'
     query_stats = None
     query_stats_skipped = False
+    probe_stats = None
+    if getattr(
+            postprocessor, 'decoder_quality_iou_mode',
+            'class_agnostic') == 'predicted_class':
+        probe_stats = FinalQualityProbeStats(query_diagnosis_output_dir)
     
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
@@ -191,7 +196,10 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
 
         outputs = model(samples)
 
-        if 'enc_topk_boxes' in outputs:
+        if probe_stats is not None:
+            probe_stats.update(outputs, targets, samples.shape[-2:])
+
+        if 'enc_topk_boxes' in outputs and probe_stats is None:
             if dist_utils.get_world_size() == 1:
                 if query_stats is None:
                     query_stats = QueryStats(
@@ -239,6 +247,14 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
     if coco_evaluator is not None:
         coco_evaluator.synchronize_between_processes()
 
+    probe_summary = None
+    if probe_stats is not None:
+        probe_stats.synchronize_between_processes()
+        main_process = dist_utils.is_main_process()
+        probe_summary = probe_stats.summarize(
+            write_output=main_process,
+            print_output=main_process)
+
     # accumulate predictions from all images
     if coco_evaluator is not None:
         coco_evaluator.accumulate()
@@ -254,6 +270,9 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
             stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
         if 'segm' in iou_types:
             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
+    if probe_summary is not None:
+        stats['decoder_quality_correlation'] = [
+            probe_summary['pearson'], probe_summary['spearman']]
             
     return stats, coco_evaluator
 

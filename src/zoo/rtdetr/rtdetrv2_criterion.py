@@ -9,7 +9,12 @@ import torchvision
 
 import copy
 
-from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
+from .box_ops import (
+    box_cxcywh_to_xyxy,
+    box_iou,
+    generalized_box_iou,
+    predicted_class_max_iou,
+)
 from ...misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from ...core import register
 
@@ -35,7 +40,9 @@ class RTDETRCriterionv2(nn.Module):
         share_matched_indices=False,
         quality_loss_topk=900,
         quality_pos_weight=4.0,
-        decoder_quality_loss_mode='all'):
+        decoder_quality_loss_mode='all',
+        final_quality_probe=False,
+        final_quality_probe_topk=100):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -62,6 +69,55 @@ class RTDETRCriterionv2(nn.Module):
             raise ValueError(
                 'decoder_quality_loss_mode must be all or positive')
         self.decoder_quality_loss_mode = decoder_quality_loss_mode
+        self.final_quality_probe = final_quality_probe
+        if final_quality_probe_topk <= 0:
+            raise ValueError('final_quality_probe_topk must be positive')
+        self.final_quality_probe_topk = final_quality_probe_topk
+
+    def loss_final_quality_probe(self, outputs, targets):
+        """Quality-Focal soft-IoU loss on top-scoring final queries only."""
+        quality_logits = outputs['pred_quality_logits'].squeeze(-1)
+        class_logits = outputs['pred_logits']
+        decoder_boxes = outputs['pred_boxes']
+        if quality_logits.shape != decoder_boxes.shape[:2]:
+            raise ValueError(
+                'Probe quality logits and boxes must share shape [B, Q]')
+        if class_logits.shape[:2] != decoder_boxes.shape[:2]:
+            raise ValueError(
+                'Probe class logits and boxes must share shape [B, Q]')
+
+        topk = min(self.final_quality_probe_topk, decoder_boxes.shape[1])
+        with torch.no_grad():
+            detached_logits = class_logits.detach()
+            detached_boxes = decoder_boxes.detach()
+            class_scores = detached_logits.sigmoid().amax(dim=-1)
+            sample_indices = torch.topk(
+                class_scores, topk, dim=1).indices
+            quality_targets = []
+            for batch_index, target in enumerate(targets):
+                target_boxes = target['boxes'].as_subclass(torch.Tensor).to(
+                    device=detached_boxes.device,
+                    dtype=detached_boxes.dtype).detach()
+                target_labels = target['labels'].as_subclass(torch.Tensor).to(
+                    device=detached_logits.device,
+                    dtype=torch.long)
+                quality_targets.append(predicted_class_max_iou(
+                    detached_logits[batch_index],
+                    box_cxcywh_to_xyxy(detached_boxes[batch_index]),
+                    target_labels,
+                    box_cxcywh_to_xyxy(target_boxes)))
+            quality_targets = torch.stack(quality_targets).detach()
+            sampled_targets = quality_targets.gather(
+                1, sample_indices).to(quality_logits.dtype)
+
+        sampled_logits = quality_logits.gather(1, sample_indices)
+        probabilities = sampled_logits.sigmoid()
+        modulation = (sampled_targets - probabilities).abs().square()
+        element_loss = F.binary_cross_entropy_with_logits(
+            sampled_logits, sampled_targets, reduction='none')
+        return {
+            'loss_final_quality_probe': (modulation * element_loss).mean()
+        }
 
     def loss_quality(self, outputs, targets):
         """Supervise encoder quality with detached max IoU to any GT box."""
@@ -259,6 +315,14 @@ class RTDETRCriterionv2(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        if self.final_quality_probe:
+            probe_losses = self.loss_final_quality_probe(outputs, targets)
+            return {
+                key: value * self.weight_dict[key]
+                for key, value in probe_losses.items()
+                if key in self.weight_dict
+            }
+
         outputs_without_aux = {k: v for k, v in outputs.items() if 'aux' not in k}
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes

@@ -252,12 +252,14 @@ class TransformerDecoder(nn.Module):
                 score_head,
                 quality_head,
                 quality_detach,
+                final_quality_probe_head,
                 query_pos_head,
                 attn_mask=None,
                 memory_mask=None):
         dec_out_bboxes = []
         dec_out_logits = []
         dec_out_quality_logits = []
+        final_quality_probe_logits = None
         ref_points_detach = F.sigmoid(ref_points_unact)
 
         output = target
@@ -266,6 +268,12 @@ class TransformerDecoder(nn.Module):
             query_pos_embed = query_pos_head(ref_points_detach)
 
             output = layer(output, ref_points_input, memory, memory_spatial_shapes, attn_mask, memory_mask, query_pos_embed)
+
+            if (final_quality_probe_head is not None
+                    and ((self.training and i == self.num_layers - 1)
+                         or (not self.training and i == self.eval_idx))):
+                final_quality_probe_logits = final_quality_probe_head(
+                    output.detach())
 
             inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
 
@@ -296,7 +304,7 @@ class TransformerDecoder(nn.Module):
             torch.stack(dec_out_quality_logits)
             if dec_out_quality_logits else None)
         return (torch.stack(dec_out_bboxes), torch.stack(dec_out_logits),
-                quality_outputs)
+                quality_outputs, final_quality_probe_logits)
 
 
 @register()
@@ -329,7 +337,8 @@ class RTDETRTransformerv2(nn.Module):
                  quality_alpha=1.0,
                  quality_beta=1.0,
                  decoder_quality=False,
-                 decoder_quality_detach=False):
+                 decoder_quality_detach=False,
+                 final_quality_probe=False):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -356,6 +365,10 @@ class RTDETRTransformerv2(nn.Module):
         self.quality_beta = quality_beta
         self.decoder_quality = decoder_quality
         self.decoder_quality_detach = decoder_quality_detach
+        self.final_quality_probe = final_quality_probe
+        if decoder_quality and final_quality_probe:
+            raise ValueError(
+                'decoder_quality and final_quality_probe are mutually exclusive')
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -408,6 +421,12 @@ class RTDETRTransformerv2(nn.Module):
             self.dec_quality_head = nn.ModuleList([
                 nn.Linear(hidden_dim, 1) for _ in range(num_layers)
             ])
+        if final_quality_probe:
+            self.final_quality_probe_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -434,6 +453,9 @@ class RTDETRTransformerv2(nn.Module):
             for quality_head in self.dec_quality_head:
                 init.constant_(quality_head.weight, 0)
                 init.constant_(quality_head.bias, 0)
+        if self.final_quality_probe:
+            init.constant_(self.final_quality_probe_head[-1].weight, 0)
+            init.constant_(self.final_quality_probe_head[-1].bias, 0)
         
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learn_query_content:
@@ -656,7 +678,8 @@ class RTDETRTransformerv2(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_quality_logits = self.decoder(
+        (out_bboxes, out_logits, out_quality_logits,
+         final_quality_probe_logits) = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -665,6 +688,8 @@ class RTDETRTransformerv2(nn.Module):
             self.dec_score_head,
             self.dec_quality_head if self.decoder_quality else None,
             self.decoder_quality_detach,
+            (self.final_quality_probe_head
+             if self.final_quality_probe else None),
             self.query_pos_head,
             attn_mask=attn_mask)
 
@@ -674,10 +699,16 @@ class RTDETRTransformerv2(nn.Module):
             if out_quality_logits is not None:
                 _, out_quality_logits = torch.split(
                     out_quality_logits, dn_meta['dn_num_split'], dim=2)
+            if final_quality_probe_logits is not None:
+                _, final_quality_probe_logits = torch.split(
+                    final_quality_probe_logits,
+                    dn_meta['dn_num_split'], dim=1)
 
         out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
         if out_quality_logits is not None:
             out['pred_quality_logits'] = out_quality_logits[-1]
+        if final_quality_probe_logits is not None:
+            out['pred_quality_logits'] = final_quality_probe_logits
 
         if self.training and encoder_quality_outputs is not None:
             out.update(encoder_quality_outputs)

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torchvision
 
 from ...core import register
+from .box_ops import predicted_class_max_iou
 
 
 __all__ = ['RTDETRPostProcessor']
@@ -38,6 +39,7 @@ class RTDETRPostProcessor(nn.Module):
         class_aware_oracle_final_iou_gamma=0.0,
         final_score_method='default',
         decoder_quality_beta=1.0,
+        decoder_quality_iou_mode='class_agnostic',
     ) -> None:
         super().__init__()
         self.use_focal_loss = use_focal_loss
@@ -53,6 +55,12 @@ class RTDETRPostProcessor(nn.Module):
                 f'Unsupported final_score_method: {final_score_method}')
         self.final_score_method = final_score_method
         self.decoder_quality_beta = float(decoder_quality_beta)
+        if decoder_quality_iou_mode not in (
+                'class_agnostic', 'predicted_class'):
+            raise ValueError(
+                'decoder_quality_iou_mode must be class_agnostic or '
+                'predicted_class')
+        self.decoder_quality_iou_mode = decoder_quality_iou_mode
         active_rerankers = sum(gamma != 0.0 for gamma in (
             self.final_quality_gamma,
             self.oracle_final_iou_gamma,
@@ -76,7 +84,8 @@ class RTDETRPostProcessor(nn.Module):
                 'class_aware_oracle_final_iou_gamma='
                 f'{self.class_aware_oracle_final_iou_gamma}, '
                 f'final_score_method={self.final_score_method}, '
-                f'decoder_quality_beta={self.decoder_quality_beta}')
+                f'decoder_quality_beta={self.decoder_quality_beta}, '
+                f'decoder_quality_iou_mode={self.decoder_quality_iou_mode}')
     
     # def forward(self, outputs, orig_target_sizes):
     def forward(self, outputs, orig_target_sizes: torch.Tensor,
@@ -110,7 +119,6 @@ class RTDETRPostProcessor(nn.Module):
                 # Strict requested oracle: one predicted-class quality per query.
                 class_aware_oracle_quality = logits.new_zeros(
                     (*logits.shape[:2], 1))
-                predicted_classes = logits.argmax(dim=-1)
             for batch_index, target in enumerate(targets):
                 target_boxes = target['boxes'].as_subclass(torch.Tensor).to(
                     device=bbox_pred.device, dtype=bbox_pred.dtype)
@@ -134,16 +142,12 @@ class RTDETRPostProcessor(nn.Module):
                         oracle_quality[batch_index, :, class_id] = \
                             ious[:, class_mask].max(dim=1).values.to(logits.dtype)
                 else:
-                    image_predicted_classes = predicted_classes[batch_index]
-                    for class_id in image_predicted_classes.unique().tolist():
-                        class_mask = target_labels == class_id
-                        if not class_mask.any():
-                            continue
-                        query_mask = image_predicted_classes == class_id
-                        class_aware_oracle_quality[
-                            batch_index, query_mask, 0] = ious[
-                                query_mask][:, class_mask].max(
-                                    dim=1).values.to(logits.dtype)
+                    class_aware_oracle_quality[batch_index, :, 0] = \
+                        predicted_class_max_iou(
+                            logits[batch_index].detach(),
+                            bbox_pred[batch_index].detach(),
+                            target_labels,
+                            target_boxes).to(logits.dtype)
         bbox_pred *= orig_target_sizes.repeat(1, 2).unsqueeze(1)
 
         if self.use_focal_loss:

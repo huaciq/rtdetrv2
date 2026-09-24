@@ -1,6 +1,7 @@
 """Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+import math
 import time 
 import json
 import datetime
@@ -40,6 +41,9 @@ class DetSolver(BaseSolver):
         print(f'number of trainable parameters: {n_parameters}')
 
         best_stat = {'epoch': -1, }
+        checkpoint_metric = args.yaml_cfg.get('checkpoint_metric')
+        if checkpoint_metric is not None:
+            print(f'Best checkpoint metric: {checkpoint_metric}[0]')
 
         start_time = time.time()
         start_epcoch = self.last_epoch + 1
@@ -89,21 +93,46 @@ class DetSolver(BaseSolver):
                 self.device
             )
 
-            # TODO 
+            # TODO
             for k in test_stats:
                 if self.writer and dist_utils.is_main_process():
                     for i, v in enumerate(test_stats[k]):
                         self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
-            
-                if k in best_stat:
-                    best_stat['epoch'] = epoch if test_stats[k][0] > best_stat[k] else best_stat['epoch']
-                    best_stat[k] = max(best_stat[k], test_stats[k][0])
-                else:
-                    best_stat['epoch'] = epoch
-                    best_stat[k] = test_stats[k][0]
 
-                if best_stat['epoch'] == epoch and self.output_dir:
-                    dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best.pth')
+            if checkpoint_metric is None:
+                for k in test_stats:
+                    if k in best_stat:
+                        best_stat['epoch'] = epoch if test_stats[k][0] > best_stat[k] else best_stat['epoch']
+                        best_stat[k] = max(best_stat[k], test_stats[k][0])
+                    else:
+                        best_stat['epoch'] = epoch
+                        best_stat[k] = test_stats[k][0]
+
+                    if best_stat['epoch'] == epoch and self.output_dir:
+                        dist_utils.save_on_master(
+                            self.state_dict(), self.output_dir / 'best.pth')
+            else:
+                if checkpoint_metric not in test_stats:
+                    raise KeyError(
+                        f'Checkpoint metric {checkpoint_metric!r} missing '
+                        f'from validation stats {tuple(test_stats)}')
+                metric_value = test_stats[checkpoint_metric][0]
+                improved = (
+                    checkpoint_metric not in best_stat
+                    or (math.isfinite(metric_value)
+                        and not math.isfinite(best_stat[checkpoint_metric]))
+                    or metric_value > best_stat[checkpoint_metric])
+                if improved:
+                    best_stat['epoch'] = epoch
+                    best_stat[checkpoint_metric] = metric_value
+                    if self.output_dir:
+                        state = self.state_dict()
+                        dist_utils.save_on_master(
+                            state, self.output_dir / 'best.pth')
+                        dist_utils.save_on_master(
+                            state,
+                            self.output_dir /
+                            'best_decoder_quality_correlation.pth')
 
             print(f'best_stat: {best_stat}')
 

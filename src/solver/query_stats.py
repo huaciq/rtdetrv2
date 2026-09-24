@@ -8,7 +8,11 @@ from pathlib import Path
 import torch
 from PIL import Image, ImageDraw
 
-from ..zoo.rtdetr.box_ops import box_cxcywh_to_xyxy, box_iou
+from ..zoo.rtdetr.box_ops import (
+    box_cxcywh_to_xyxy,
+    box_iou,
+    predicted_class_max_iou,
+)
 
 
 class QueryStats:
@@ -935,3 +939,114 @@ class QueryStats:
                     print(f'  P{level + 3}: {count} ({value:.6f})')
 
         self._write_background_artifacts()
+
+
+class FinalQualityProbeStats:
+    """Distributed-safe final quality/IoU diagnostics for probe training."""
+
+    QUALITY_IOU_BINS = QueryStats.QUALITY_IOU_BINS
+
+    def __init__(self, output_dir=None):
+        self.output_dir = Path(output_dir) if output_dir is not None else None
+        self.scores = []
+        self.ious = []
+
+    def update(self, outputs, targets, image_hw):
+        quality_logits = outputs.get('pred_quality_logits')
+        if quality_logits is None:
+            raise KeyError(
+                'Final quality probe diagnostics require pred_quality_logits')
+        class_logits = outputs['pred_logits']
+        boxes = outputs['pred_boxes']
+        if quality_logits.shape != (*boxes.shape[:2], 1):
+            raise ValueError(
+                'pred_quality_logits must have shape [B, Q, 1]')
+        if class_logits.shape[:2] != boxes.shape[:2]:
+            raise ValueError('pred_logits and pred_boxes must share [B, Q]')
+
+        image_h, image_w = image_hw
+        pred_xyxy = box_cxcywh_to_xyxy(boxes.detach().float())
+        for batch_index, target in enumerate(targets):
+            target_boxes = target['boxes'].as_subclass(torch.Tensor).to(
+                device=pred_xyxy.device, dtype=pred_xyxy.dtype)
+            box_format = getattr(target['boxes'], 'format', None)
+            if box_format is not None and 'XYXY' not in str(box_format).upper():
+                raise ValueError(
+                    'Probe validation expects GT in pixel-space XYXY')
+            scale = target_boxes.new_tensor(
+                [image_w, image_h, image_w, image_h])
+            target_boxes = target_boxes / scale
+            target_labels = target['labels'].as_subclass(torch.Tensor).to(
+                device=class_logits.device, dtype=torch.long)
+            true_quality = predicted_class_max_iou(
+                class_logits[batch_index].detach(),
+                pred_xyxy[batch_index],
+                target_labels,
+                target_boxes)
+            self.scores.append(
+                quality_logits[batch_index, :, 0].sigmoid().detach().float().cpu())
+            self.ious.append(true_quality.detach().float().cpu())
+
+    def synchronize_between_processes(self):
+        scores = torch.cat(self.scores) if self.scores else torch.empty(0)
+        ious = torch.cat(self.ious) if self.ious else torch.empty(0)
+        if (torch.distributed.is_available()
+                and torch.distributed.is_initialized()):
+            gathered = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered, (scores, ious))
+            scores = torch.cat([item[0] for item in gathered])
+            ious = torch.cat([item[1] for item in gathered])
+        self.scores = [scores]
+        self.ious = [ious]
+
+    def summarize(self, write_output=True, print_output=True):
+        count, pearson, spearman = QueryStats._correlations(
+            self.scores, self.ious)
+        scores = torch.cat(self.scores) if self.scores else torch.empty(0)
+        ious = torch.cat(self.ious) if self.ious else torch.empty(0)
+        bins = {}
+        if print_output:
+            print('\nFinal Quality Probe vs Predicted-Class-Aware Final IoU:')
+            print(f'n={count}')
+            print(f'  Pearson: {QueryStats._format_metric(pearson)}')
+            print(f'  Spearman: {QueryStats._format_metric(spearman)}')
+        for label, lower, upper in self.QUALITY_IOU_BINS:
+            mask = ious >= lower
+            if upper is not None:
+                mask &= ious < upper
+            bucket_count = int(mask.sum().item())
+            mean_quality = (
+                float(scores[mask].mean().item()) if bucket_count else None)
+            mean_true_iou = (
+                float(ious[mask].mean().item()) if bucket_count else None)
+            formatted_quality = (
+                f'{mean_quality:.6f}' if mean_quality is not None else 'N/A')
+            formatted_iou = (
+                f'{mean_true_iou:.6f}' if mean_true_iou is not None else 'N/A')
+            if print_output:
+                print(f'{label}: mean predicted quality={formatted_quality}, '
+                      f'mean true IoU={formatted_iou}, n={bucket_count}')
+            bins[label] = {
+                'sample_count': bucket_count,
+                'mean_predicted_quality': mean_quality,
+                'mean_true_iou': mean_true_iou,
+            }
+
+        summary = {
+            'sample_count': count,
+            'pearson': pearson,
+            'spearman': spearman,
+            'iou_definition': (
+                'max IoU between each final decoder bbox and GT boxes whose '
+                'class equals argmax(detached final class logits); zero when '
+                'that predicted class has no GT'),
+            'bins': bins,
+        }
+        if write_output and self.output_dir is not None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = self.output_dir / 'decoder_quality_alignment.json'
+            with output_path.open('w', encoding='utf-8') as file:
+                json.dump(summary, file, indent=2)
+            if print_output:
+                print(f'  JSON: {output_path}')
+        return summary
