@@ -81,7 +81,7 @@ class QueryStats:
         self.final_score_chunks = {'scores': [], 'ious': []}
         self.decoder_quality_chunks = {'scores': [], 'ious': []}
         self.decoder_quality_iou_bins = {
-            label: {'quality_sum': 0.0, 'count': 0}
+            label: {'quality_sum': 0.0, 'iou_sum': 0.0, 'count': 0}
             for label, _, _ in self.QUALITY_IOU_BINS
         }
         self.gt_query_comparison = {
@@ -492,6 +492,8 @@ class QueryStats:
                         bucket = self.decoder_quality_iou_bins[label]
                         bucket['quality_sum'] += \
                             predicted_decoder_quality[mask].sum().item()
+                        bucket['iou_sum'] += \
+                            final_query_best_iou[mask].sum().item()
                         bucket['count'] += count
 
             for threshold in self.IOU_THRESHOLDS:
@@ -789,13 +791,20 @@ class QueryStats:
                 bucket = self.decoder_quality_iou_bins[label]
                 mean_quality = self._ratio(
                     bucket['quality_sum'], bucket['count'])
+                mean_true_iou = self._ratio(
+                    bucket['iou_sum'], bucket['count'])
                 formatted_mean = (
                     f'{mean_quality:.6f}' if bucket['count'] else 'N/A')
+                formatted_true_iou = (
+                    f'{mean_true_iou:.6f}' if bucket['count'] else 'N/A')
                 print(f'{label}: mean predicted quality={formatted_mean}, '
-                      f"n={bucket['count']}")
+                      f'mean true IoU={formatted_true_iou}, '
+                      f'n={bucket["count"]}')
                 bins[label] = {
                     'mean_predicted_quality': (
                         mean_quality if bucket['count'] else None),
+                    'mean_true_iou': (
+                        mean_true_iou if bucket['count'] else None),
                     'sample_count': bucket['count'],
                 }
             if self.output_dir is not None:

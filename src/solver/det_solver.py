@@ -13,6 +13,22 @@ from ._solver import BaseSolver
 from .det_engine import train_one_epoch, evaluate
 
 
+def _get_coco_ar75(coco_eval):
+    """Return AR at IoU=.75, area=all, maxDets=100."""
+    params = coco_eval.params
+    iou_index = min(
+        range(len(params.iouThrs)),
+        key=lambda index: abs(float(params.iouThrs[index]) - 0.75))
+    if abs(float(params.iouThrs[iou_index]) - 0.75) > 1e-6:
+        raise ValueError('COCO evaluator does not contain IoU threshold 0.75')
+    area_index = list(params.areaRngLbl).index('all')
+    max_det_index = list(params.maxDets).index(100)
+    recall = coco_eval.eval['recall'][
+        iou_index, :, area_index, max_det_index]
+    valid_recall = recall[recall > -1]
+    return float(valid_recall.mean()) if valid_recall.size else float('nan')
+
+
 class DetSolver(BaseSolver):
     
     def fit(self, ):
@@ -134,6 +150,8 @@ class DetSolver(BaseSolver):
                     'AR1', 'AR10', 'AR100', 'ARs', 'ARm', 'ARl')
                 metrics = dict(zip(
                     metric_names, test_stats['coco_eval_bbox']))
+                metrics['AR75'] = _get_coco_ar75(
+                    coco_evaluator.coco_eval['bbox'])
                 with (self.output_dir / 'evaluation_metrics.json').open(
                         'w', encoding='utf-8') as file:
                     json.dump(metrics, file, indent=2)
