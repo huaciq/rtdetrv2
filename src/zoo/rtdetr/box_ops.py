@@ -59,19 +59,44 @@ def predicted_class_max_iou(
     if target_labels.ndim != 1 or target_labels.shape[0] != target_boxes_xyxy.shape[0]:
         raise ValueError('target labels and boxes must have matching length')
 
-    quality = pred_boxes_xyxy.new_zeros(pred_logits.shape[0])
+    predicted_classes = pred_logits.argmax(dim=-1)
+    pairwise_quality = pairwise_class_max_iou(
+        pred_boxes_xyxy,
+        target_labels,
+        target_boxes_xyxy,
+        pred_logits.shape[-1])
+    return pairwise_quality.gather(
+        1, predicted_classes.unsqueeze(-1)).squeeze(-1)
+
+
+def pairwise_class_max_iou(
+        pred_boxes_xyxy: Tensor,
+        target_labels: Tensor,
+        target_boxes_xyxy: Tensor,
+        num_classes: int) -> Tensor:
+    """Return a full [query, class] max-IoU quality matrix."""
+    if pred_boxes_xyxy.ndim != 2 or pred_boxes_xyxy.shape[-1] != 4:
+        raise ValueError('pred_boxes_xyxy must have shape [Q, 4]')
+    if target_boxes_xyxy.ndim != 2 or target_boxes_xyxy.shape[-1] != 4:
+        raise ValueError('target_boxes_xyxy must have shape [G, 4]')
+    if target_labels.ndim != 1 or target_labels.shape[0] != target_boxes_xyxy.shape[0]:
+        raise ValueError('target labels and boxes must have matching length')
+    if num_classes <= 0:
+        raise ValueError('num_classes must be positive')
+    if target_labels.numel() and (
+            target_labels.min() < 0 or target_labels.max() >= num_classes):
+        raise ValueError('target labels are outside the model class range')
+
+    quality = pred_boxes_xyxy.new_zeros(
+        (pred_boxes_xyxy.shape[0], num_classes))
     if target_boxes_xyxy.numel() == 0:
         return quality
 
-    predicted_classes = pred_logits.argmax(dim=-1)
     ious, _ = box_iou(
         pred_boxes_xyxy.float(), target_boxes_xyxy.float())
-    for class_id in predicted_classes.unique().tolist():
+    for class_id in target_labels.unique().tolist():
         target_mask = target_labels == class_id
-        if not target_mask.any():
-            continue
-        query_mask = predicted_classes == class_id
-        quality[query_mask] = ious[query_mask][:, target_mask].max(
+        quality[:, class_id] = ious[:, target_mask].max(
             dim=1).values.to(quality.dtype)
     return quality
 

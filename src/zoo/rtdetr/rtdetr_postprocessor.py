@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torchvision
 
 from ...core import register
-from .box_ops import predicted_class_max_iou
+from .box_ops import pairwise_class_max_iou, predicted_class_max_iou
 
 
 __all__ = ['RTDETRPostProcessor']
@@ -37,6 +37,7 @@ class RTDETRPostProcessor(nn.Module):
         final_quality_gamma=0.0,
         oracle_final_iou_gamma=0.0,
         class_aware_oracle_final_iou_gamma=0.0,
+        pairwise_class_aware_oracle_beta=0.0,
         final_score_method='default',
         decoder_quality_beta=1.0,
         decoder_quality_iou_mode='class_agnostic',
@@ -50,6 +51,8 @@ class RTDETRPostProcessor(nn.Module):
         self.oracle_final_iou_gamma = float(oracle_final_iou_gamma)
         self.class_aware_oracle_final_iou_gamma = float(
             class_aware_oracle_final_iou_gamma)
+        self.pairwise_class_aware_oracle_beta = float(
+            pairwise_class_aware_oracle_beta)
         if final_score_method not in ('default', 'decoder_quality'):
             raise ValueError(
                 f'Unsupported final_score_method: {final_score_method}')
@@ -65,6 +68,7 @@ class RTDETRPostProcessor(nn.Module):
             self.final_quality_gamma,
             self.oracle_final_iou_gamma,
             self.class_aware_oracle_final_iou_gamma,
+            self.pairwise_class_aware_oracle_beta,
         ))
         if (self.final_score_method == 'decoder_quality'
                 and self.decoder_quality_beta != 0.0):
@@ -83,6 +87,8 @@ class RTDETRPostProcessor(nn.Module):
                 f'oracle_final_iou_gamma={self.oracle_final_iou_gamma}, '
                 'class_aware_oracle_final_iou_gamma='
                 f'{self.class_aware_oracle_final_iou_gamma}, '
+                'pairwise_class_aware_oracle_beta='
+                f'{self.pairwise_class_aware_oracle_beta}, '
                 f'final_score_method={self.final_score_method}, '
                 f'decoder_quality_beta={self.decoder_quality_beta}, '
                 f'decoder_quality_iou_mode={self.decoder_quality_iou_mode}')
@@ -98,7 +104,8 @@ class RTDETRPostProcessor(nn.Module):
         class_aware_oracle_quality = None
         oracle_enabled = (
             self.oracle_final_iou_gamma != 0.0
-            or self.class_aware_oracle_final_iou_gamma != 0.0)
+            or self.class_aware_oracle_final_iou_gamma != 0.0
+            or self.pairwise_class_aware_oracle_beta != 0.0)
         if oracle_enabled:
             if not self.use_focal_loss:
                 raise ValueError(
@@ -112,8 +119,9 @@ class RTDETRPostProcessor(nn.Module):
             image_h, image_w = image_hw
             input_scale = bbox_pred.new_tensor(
                 [image_w, image_h, image_w, image_h])
-            if self.oracle_final_iou_gamma != 0.0:
-                # Existing query-class oracle: one quality per class score.
+            if (self.oracle_final_iou_gamma != 0.0
+                    or self.pairwise_class_aware_oracle_beta != 0.0):
+                # Full query-class oracle: one quality per prediction pair.
                 oracle_quality = logits.new_zeros(logits.shape)
             else:
                 # Strict requested oracle: one predicted-class quality per query.
@@ -131,16 +139,13 @@ class RTDETRPostProcessor(nn.Module):
                 if target_boxes.numel() == 0:
                     continue
                 target_boxes = target_boxes / input_scale
-                ious = torchvision.ops.box_iou(
-                    bbox_pred[batch_index].float(), target_boxes.float())
-                if self.oracle_final_iou_gamma != 0.0:
-                    for class_id in target_labels.unique().tolist():
-                        if class_id < 0 or class_id >= self.num_classes:
-                            raise ValueError(
-                                f'GT class {class_id} is outside model class range')
-                        class_mask = target_labels == class_id
-                        oracle_quality[batch_index, :, class_id] = \
-                            ious[:, class_mask].max(dim=1).values.to(logits.dtype)
+                if (self.oracle_final_iou_gamma != 0.0
+                        or self.pairwise_class_aware_oracle_beta != 0.0):
+                    oracle_quality[batch_index] = pairwise_class_max_iou(
+                        bbox_pred[batch_index].detach(),
+                        target_labels,
+                        target_boxes,
+                        self.num_classes).to(logits.dtype)
                 else:
                     class_aware_oracle_quality[batch_index, :, 0] = \
                         predicted_class_max_iou(
@@ -180,6 +185,9 @@ class RTDETRPostProcessor(nn.Module):
             elif self.oracle_final_iou_gamma != 0.0:
                 scores = scores * oracle_quality.pow(
                     self.oracle_final_iou_gamma)
+            elif self.pairwise_class_aware_oracle_beta != 0.0:
+                scores = scores * oracle_quality.pow(
+                    self.pairwise_class_aware_oracle_beta)
             elif self.class_aware_oracle_final_iou_gamma != 0.0:
                 scores = scores * class_aware_oracle_quality.pow(
                     self.class_aware_oracle_final_iou_gamma)

@@ -222,7 +222,10 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
             getattr(postprocessor, 'oracle_final_iou_gamma', 0.0) != 0.0
             or getattr(
                 postprocessor,
-                'class_aware_oracle_final_iou_gamma', 0.0) != 0.0)
+                'class_aware_oracle_final_iou_gamma', 0.0) != 0.0
+            or getattr(
+                postprocessor,
+                'pairwise_class_aware_oracle_beta', 0.0) != 0.0)
         if oracle_enabled:
             results = postprocessor(
                 outputs, orig_target_sizes, targets=targets,

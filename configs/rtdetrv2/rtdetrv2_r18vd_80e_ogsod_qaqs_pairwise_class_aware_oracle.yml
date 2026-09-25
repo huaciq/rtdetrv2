@@ -1,0 +1,9 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_qaqs_gbs64_gpu2_zxy.yml'
+
+# Inference-only GT-assisted diagnostic. Never use these numbers as deployable
+# model performance. Override beta from the CLI for the sweep.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_80e_qaqs_pairwise_class_aware_oracle
+
+RTDETRPostProcessor:
+  pairwise_class_aware_oracle_beta: 0.0
