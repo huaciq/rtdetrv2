@@ -101,7 +101,12 @@ class RTDETRCriterionv2(nn.Module):
         if thresholds.numel() != 10:
             raise ValueError(
                 'multi_threshold_quality_thresholds must contain 10 values')
-        self.register_buffer('multi_threshold_quality_thresholds', thresholds)
+        # Thresholds are fixed experiment configuration, not learned state.
+        # Keep them device-aware without adding a new key that would make
+        # historical detector/criterion checkpoints fail strict resume.
+        self.register_buffer(
+            'multi_threshold_quality_thresholds', thresholds,
+            persistent=False)
 
     def loss_multi_threshold_class_conditioned_quality_probe(
             self, outputs, targets):
