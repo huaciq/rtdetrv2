@@ -132,7 +132,7 @@ class DetSolver(BaseSolver):
                         dist_utils.save_on_master(
                             state,
                             self.output_dir /
-                            'best_decoder_quality_correlation.pth')
+                            f'best_{checkpoint_metric}.pth')
 
             print(f'best_stat: {best_stat}')
 

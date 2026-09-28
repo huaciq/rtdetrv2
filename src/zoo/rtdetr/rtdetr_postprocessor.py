@@ -40,6 +40,7 @@ class RTDETRPostProcessor(nn.Module):
         pairwise_class_aware_oracle_beta=0.0,
         final_score_method='default',
         decoder_quality_beta=1.0,
+        class_conditioned_quality_beta=1.0,
         decoder_quality_iou_mode='class_agnostic',
     ) -> None:
         super().__init__()
@@ -53,16 +54,19 @@ class RTDETRPostProcessor(nn.Module):
             class_aware_oracle_final_iou_gamma)
         self.pairwise_class_aware_oracle_beta = float(
             pairwise_class_aware_oracle_beta)
-        if final_score_method not in ('default', 'decoder_quality'):
+        if final_score_method not in (
+                'default', 'decoder_quality', 'class_conditioned_quality'):
             raise ValueError(
                 f'Unsupported final_score_method: {final_score_method}')
         self.final_score_method = final_score_method
         self.decoder_quality_beta = float(decoder_quality_beta)
+        self.class_conditioned_quality_beta = float(
+            class_conditioned_quality_beta)
         if decoder_quality_iou_mode not in (
-                'class_agnostic', 'predicted_class'):
+                'class_agnostic', 'predicted_class', 'pairwise_class'):
             raise ValueError(
-                'decoder_quality_iou_mode must be class_agnostic or '
-                'predicted_class')
+                'decoder_quality_iou_mode must be class_agnostic, '
+                'predicted_class, or pairwise_class')
         self.decoder_quality_iou_mode = decoder_quality_iou_mode
         active_rerankers = sum(gamma != 0.0 for gamma in (
             self.final_quality_gamma,
@@ -72,6 +76,9 @@ class RTDETRPostProcessor(nn.Module):
         ))
         if (self.final_score_method == 'decoder_quality'
                 and self.decoder_quality_beta != 0.0):
+            active_rerankers += 1
+        if (self.final_score_method == 'class_conditioned_quality'
+                and self.class_conditioned_quality_beta != 0.0):
             active_rerankers += 1
         if active_rerankers > 1:
             raise ValueError(
@@ -91,6 +98,8 @@ class RTDETRPostProcessor(nn.Module):
                 f'{self.pairwise_class_aware_oracle_beta}, '
                 f'final_score_method={self.final_score_method}, '
                 f'decoder_quality_beta={self.decoder_quality_beta}, '
+                'class_conditioned_quality_beta='
+                f'{self.class_conditioned_quality_beta}, '
                 f'decoder_quality_iou_mode={self.decoder_quality_iou_mode}')
     
     # def forward(self, outputs, orig_target_sizes):
@@ -171,6 +180,19 @@ class RTDETRPostProcessor(nn.Module):
                 decoder_quality = decoder_quality_logits.sigmoid()
                 scores = scores * decoder_quality.pow(
                     self.decoder_quality_beta)
+            elif (self.final_score_method == 'class_conditioned_quality'
+                    and self.class_conditioned_quality_beta != 0.0):
+                if 'pred_quality_logits' not in outputs:
+                    raise KeyError(
+                        'class-conditioned quality scoring requires '
+                        'pred_quality_logits')
+                quality_logits = outputs['pred_quality_logits']
+                if quality_logits.shape != scores.shape:
+                    raise ValueError(
+                        'Class-conditioned pred_quality_logits must have '
+                        'shape [B, Q, C] matching classification scores')
+                scores = scores * quality_logits.sigmoid().pow(
+                    self.class_conditioned_quality_beta)
             elif self.final_quality_gamma != 0.0:
                 if 'enc_topk_quality_logits' not in outputs:
                     raise KeyError(

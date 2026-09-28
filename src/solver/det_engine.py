@@ -17,7 +17,11 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
-from .query_stats import FinalQualityProbeStats, QueryStats
+from .query_stats import (
+    ClassConditionedQualityProbeStats,
+    FinalQualityProbeStats,
+    QueryStats,
+)
 
 
 def optimized_loss(loss_dict):
@@ -185,10 +189,13 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
     query_stats = None
     query_stats_skipped = False
     probe_stats = None
-    if getattr(
-            postprocessor, 'decoder_quality_iou_mode',
-            'class_agnostic') == 'predicted_class':
+    quality_diagnostic_mode = getattr(
+        postprocessor, 'decoder_quality_iou_mode', 'class_agnostic')
+    if quality_diagnostic_mode == 'predicted_class':
         probe_stats = FinalQualityProbeStats(query_diagnosis_output_dir)
+    elif quality_diagnostic_mode == 'pairwise_class':
+        probe_stats = ClassConditionedQualityProbeStats(
+            query_diagnosis_output_dir)
     
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
@@ -274,7 +281,7 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
         if 'segm' in iou_types:
             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
     if probe_summary is not None:
-        stats['decoder_quality_correlation'] = [
+        stats[probe_stats.metric_name] = [
             probe_summary['pearson'], probe_summary['spearman']]
             
     return stats, coco_evaluator

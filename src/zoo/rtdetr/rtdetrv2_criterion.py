@@ -13,6 +13,7 @@ from .box_ops import (
     box_cxcywh_to_xyxy,
     box_iou,
     generalized_box_iou,
+    pairwise_class_max_iou,
     predicted_class_max_iou,
 )
 from ...misc.dist_utils import get_world_size, is_dist_available_and_initialized
@@ -42,7 +43,9 @@ class RTDETRCriterionv2(nn.Module):
         quality_pos_weight=4.0,
         decoder_quality_loss_mode='all',
         final_quality_probe=False,
-        final_quality_probe_topk=100):
+        final_quality_probe_topk=100,
+        class_conditioned_final_quality_probe=False,
+        class_conditioned_quality_topk=100):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -73,6 +76,60 @@ class RTDETRCriterionv2(nn.Module):
         if final_quality_probe_topk <= 0:
             raise ValueError('final_quality_probe_topk must be positive')
         self.final_quality_probe_topk = final_quality_probe_topk
+        self.class_conditioned_final_quality_probe = \
+            class_conditioned_final_quality_probe
+        if final_quality_probe and class_conditioned_final_quality_probe:
+            raise ValueError('Final quality probe modes are mutually exclusive')
+        if class_conditioned_quality_topk <= 0:
+            raise ValueError('class_conditioned_quality_topk must be positive')
+        self.class_conditioned_quality_topk = class_conditioned_quality_topk
+
+    def loss_class_conditioned_final_quality_probe(self, outputs, targets):
+        """Quality-Focal loss on classification Top-K query-class pairs."""
+        quality_logits = outputs['pred_quality_logits']
+        class_logits = outputs['pred_logits']
+        decoder_boxes = outputs['pred_boxes']
+        if quality_logits.shape != class_logits.shape:
+            raise ValueError(
+                'Class-conditioned quality logits must match [B, Q, C] '
+                'classification logits')
+        if class_logits.shape[:2] != decoder_boxes.shape[:2]:
+            raise ValueError(
+                'Class logits and decoder boxes must share shape [B, Q]')
+
+        pair_count = class_logits.shape[1] * class_logits.shape[2]
+        topk = min(self.class_conditioned_quality_topk, pair_count)
+        with torch.no_grad():
+            detached_logits = class_logits.detach()
+            detached_boxes = decoder_boxes.detach()
+            sample_indices = torch.topk(
+                detached_logits.sigmoid().flatten(1), topk, dim=1).indices
+            quality_targets = []
+            for batch_index, target in enumerate(targets):
+                target_boxes = target['boxes'].as_subclass(torch.Tensor).to(
+                    device=detached_boxes.device,
+                    dtype=detached_boxes.dtype).detach()
+                target_labels = target['labels'].as_subclass(torch.Tensor).to(
+                    device=detached_logits.device,
+                    dtype=torch.long)
+                quality_targets.append(pairwise_class_max_iou(
+                    box_cxcywh_to_xyxy(detached_boxes[batch_index]),
+                    target_labels,
+                    box_cxcywh_to_xyxy(target_boxes),
+                    self.num_classes))
+            quality_targets = torch.stack(quality_targets).detach()
+            sampled_targets = quality_targets.flatten(1).gather(
+                1, sample_indices).to(quality_logits.dtype)
+
+        sampled_logits = quality_logits.flatten(1).gather(1, sample_indices)
+        probabilities = sampled_logits.sigmoid()
+        modulation = (sampled_targets - probabilities).abs().square()
+        element_loss = F.binary_cross_entropy_with_logits(
+            sampled_logits, sampled_targets, reduction='none')
+        return {
+            'loss_class_conditioned_quality': (
+                modulation * element_loss).mean()
+        }
 
     def loss_final_quality_probe(self, outputs, targets):
         """Quality-Focal soft-IoU loss on top-scoring final queries only."""
@@ -315,6 +372,15 @@ class RTDETRCriterionv2(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        if self.class_conditioned_final_quality_probe:
+            probe_losses = self.loss_class_conditioned_final_quality_probe(
+                outputs, targets)
+            return {
+                key: value * self.weight_dict[key]
+                for key, value in probe_losses.items()
+                if key in self.weight_dict
+            }
+
         if self.final_quality_probe:
             probe_losses = self.loss_final_quality_probe(outputs, targets)
             return {

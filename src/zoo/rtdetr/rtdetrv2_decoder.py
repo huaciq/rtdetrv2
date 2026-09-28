@@ -338,7 +338,8 @@ class RTDETRTransformerv2(nn.Module):
                  quality_beta=1.0,
                  decoder_quality=False,
                  decoder_quality_detach=False,
-                 final_quality_probe=False):
+                 final_quality_probe=False,
+                 class_conditioned_final_quality_probe=False):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -366,9 +367,16 @@ class RTDETRTransformerv2(nn.Module):
         self.decoder_quality = decoder_quality
         self.decoder_quality_detach = decoder_quality_detach
         self.final_quality_probe = final_quality_probe
-        if decoder_quality and final_quality_probe:
+        self.class_conditioned_final_quality_probe = \
+            class_conditioned_final_quality_probe
+        quality_modes = sum((
+            bool(decoder_quality),
+            bool(final_quality_probe),
+            bool(class_conditioned_final_quality_probe),
+        ))
+        if quality_modes > 1:
             raise ValueError(
-                'decoder_quality and final_quality_probe are mutually exclusive')
+                'decoder quality modes are mutually exclusive')
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -427,6 +435,12 @@ class RTDETRTransformerv2(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, 1),
             )
+        if class_conditioned_final_quality_probe:
+            self.class_conditioned_quality_probe_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, num_classes),
+            )
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -456,6 +470,11 @@ class RTDETRTransformerv2(nn.Module):
         if self.final_quality_probe:
             init.constant_(self.final_quality_probe_head[-1].weight, 0)
             init.constant_(self.final_quality_probe_head[-1].bias, 0)
+        if self.class_conditioned_final_quality_probe:
+            init.constant_(
+                self.class_conditioned_quality_probe_head[-1].weight, 0)
+            init.constant_(
+                self.class_conditioned_quality_probe_head[-1].bias, 0)
         
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learn_query_content:
@@ -689,7 +708,10 @@ class RTDETRTransformerv2(nn.Module):
             self.dec_quality_head if self.decoder_quality else None,
             self.decoder_quality_detach,
             (self.final_quality_probe_head
-             if self.final_quality_probe else None),
+             if self.final_quality_probe
+             else self.class_conditioned_quality_probe_head
+             if self.class_conditioned_final_quality_probe
+             else None),
             self.query_pos_head,
             attn_mask=attn_mask)
 

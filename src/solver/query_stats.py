@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 from ..zoo.rtdetr.box_ops import (
     box_cxcywh_to_xyxy,
     box_iou,
+    pairwise_class_max_iou,
     predicted_class_max_iou,
 )
 
@@ -955,6 +956,7 @@ class FinalQualityProbeStats:
         ('0.9 <= IoU <= 1.0', 0.9, None),
     )
     PER_CLASS_TOPK = 100
+    metric_name = 'decoder_quality_correlation'
 
     def __init__(self, output_dir=None):
         self.output_dir = Path(output_dir) if output_dir is not None else None
@@ -1241,4 +1243,144 @@ class FinalQualityProbeStats:
             if print_output:
                 print(f'  JSON: {output_path}')
                 print(f'  JSON: {diagnosis_path}')
+        return summary
+
+
+class ClassConditionedQualityProbeStats:
+    """Top-pair diagnostics for a [query, class] final quality probe."""
+
+    TOPK = 100
+    IOU_CONDITIONS = (0.1, 0.3, 0.5, 0.75)
+    HIGH_IOU_BINS = FinalQualityProbeStats.HIGH_IOU_BINS
+    metric_name = 'class_conditioned_quality_correlation'
+
+    def __init__(self, output_dir=None):
+        self.output_dir = Path(output_dir) if output_dir is not None else None
+        self.scores = []
+        self.ious = []
+
+    def update(self, outputs, targets, image_hw):
+        quality_logits = outputs.get('pred_quality_logits')
+        if quality_logits is None:
+            raise KeyError(
+                'Class-conditioned diagnostics require pred_quality_logits')
+        class_logits = outputs['pred_logits']
+        boxes = outputs['pred_boxes']
+        if quality_logits.shape != class_logits.shape:
+            raise ValueError(
+                'Class-conditioned quality and class logits must share '
+                'shape [B, Q, C]')
+        if class_logits.shape[:2] != boxes.shape[:2]:
+            raise ValueError('pred_logits and pred_boxes must share [B, Q]')
+
+        image_h, image_w = image_hw
+        pred_xyxy = box_cxcywh_to_xyxy(boxes.detach().float())
+        for batch_index, target in enumerate(targets):
+            target_boxes = target['boxes'].as_subclass(torch.Tensor).to(
+                device=pred_xyxy.device, dtype=pred_xyxy.dtype)
+            box_format = getattr(target['boxes'], 'format', None)
+            if box_format is not None and 'XYXY' not in str(box_format).upper():
+                raise ValueError(
+                    'Probe validation expects GT in pixel-space XYXY')
+            scale = target_boxes.new_tensor(
+                [image_w, image_h, image_w, image_h])
+            target_boxes = target_boxes / scale
+            target_labels = target['labels'].as_subclass(torch.Tensor).to(
+                device=class_logits.device, dtype=torch.long)
+            true_quality = pairwise_class_max_iou(
+                pred_xyxy[batch_index],
+                target_labels,
+                target_boxes,
+                class_logits.shape[-1])
+            pair_scores = class_logits[batch_index].detach().sigmoid().flatten()
+            count = min(self.TOPK, pair_scores.numel())
+            indices = torch.topk(pair_scores, count, dim=0).indices
+            self.scores.append(
+                quality_logits[batch_index].sigmoid().detach().flatten()[
+                    indices].float().cpu())
+            self.ious.append(
+                true_quality.detach().flatten()[indices].float().cpu())
+
+    def synchronize_between_processes(self):
+        scores = torch.cat(self.scores) if self.scores else torch.empty(0)
+        ious = torch.cat(self.ious) if self.ious else torch.empty(0)
+        if (torch.distributed.is_available()
+                and torch.distributed.is_initialized()):
+            gathered = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered, (scores, ious))
+            scores = torch.cat([item[0] for item in gathered])
+            ious = torch.cat([item[1] for item in gathered])
+        self.scores = [scores]
+        self.ious = [ious]
+
+    def summarize(self, write_output=True, print_output=True):
+        scores = torch.cat(self.scores) if self.scores else torch.empty(0)
+        ious = torch.cat(self.ious) if self.ious else torch.empty(0)
+        overall = FinalQualityProbeStats._correlation_summary(scores, ious)
+        if print_output:
+            print('\nClass-Conditioned Quality, Classification Top-100 Pairs:')
+            print(f'n={overall["sample_count"]}')
+            print(f'  Pearson: {QueryStats._format_metric(overall["pearson"])}')
+            print(f'  Spearman: {QueryStats._format_metric(overall["spearman"])}')
+
+        conditions = {}
+        if print_output:
+            print('\nConditional Correlation by True Pair Quality:')
+        for threshold in self.IOU_CONDITIONS:
+            mask = ious > threshold
+            correlation = FinalQualityProbeStats._correlation_summary(
+                scores[mask], ious[mask])
+            key = f'true_quality > {threshold:g}'
+            conditions[key] = correlation
+            if print_output:
+                print(
+                    f'{key} (n={correlation["sample_count"]}): '
+                    f'Pearson={QueryStats._format_metric(correlation["pearson"])}, '
+                    f'Spearman={QueryStats._format_metric(correlation["spearman"])}')
+
+        bins = {}
+        if print_output:
+            print('\nHigh True-Quality Pair Bins:')
+        for label, lower, upper in self.HIGH_IOU_BINS:
+            mask = ious >= lower
+            if upper is not None:
+                mask &= ious < upper
+            count = int(mask.sum().item())
+            mean_quality = (
+                float(scores[mask].mean().item()) if count else None)
+            mean_true_iou = (
+                float(ious[mask].mean().item()) if count else None)
+            bins[label] = {
+                'sample_count': count,
+                'mean_predicted_quality': mean_quality,
+                'mean_true_quality': mean_true_iou,
+            }
+            if print_output:
+                predicted_text = (
+                    f'{mean_quality:.6f}' if mean_quality is not None else 'N/A')
+                true_text = (
+                    f'{mean_true_iou:.6f}' if mean_true_iou is not None else 'N/A')
+                print(f'{label}: mean predicted quality={predicted_text}, '
+                      f'mean true quality={true_text}, n={count}')
+
+        summary = {
+            **overall,
+            'selection': (
+                'per image Top-100 over flattened '
+                'sigmoid(detached final_logits)[query,class] pairs'),
+            'target_definition': (
+                'max IoU between final bbox of query i and GT boxes of '
+                'class c; zero when class c is absent'),
+            'conditional_correlations': conditions,
+            'high_quality_bins': bins,
+        }
+        if write_output and self.output_dir is not None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = (
+                self.output_dir /
+                'class_conditioned_quality_alignment.json')
+            with output_path.open('w', encoding='utf-8') as file:
+                json.dump(summary, file, indent=2)
+            if print_output:
+                print(f'  JSON: {output_path}')
         return summary
