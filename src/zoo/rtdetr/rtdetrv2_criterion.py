@@ -108,6 +108,18 @@ class RTDETRCriterionv2(nn.Module):
             'multi_threshold_quality_thresholds', thresholds,
             persistent=False)
 
+    def _load_from_state_dict(
+            self, state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs):
+        # Commit 518679e briefly stored this fixed configuration tensor in
+        # probe checkpoints. Accept those checkpoints as well as historical
+        # QAQS checkpoints that predate the tensor entirely.
+        state_dict.pop(
+            prefix + 'multi_threshold_quality_thresholds', None)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
+
     def loss_multi_threshold_class_conditioned_quality_probe(
             self, outputs, targets):
         """BCE over COCO IoU thresholds on classification Top-K pairs."""
