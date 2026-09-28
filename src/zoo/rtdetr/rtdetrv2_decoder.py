@@ -339,7 +339,11 @@ class RTDETRTransformerv2(nn.Module):
                  decoder_quality=False,
                  decoder_quality_detach=False,
                  final_quality_probe=False,
-                 class_conditioned_final_quality_probe=False):
+                 class_conditioned_final_quality_probe=False,
+                 multi_threshold_class_conditioned_quality_probe=False,
+                 multi_threshold_quality_thresholds=(
+                     0.50, 0.55, 0.60, 0.65, 0.70,
+                     0.75, 0.80, 0.85, 0.90, 0.95)):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -369,10 +373,18 @@ class RTDETRTransformerv2(nn.Module):
         self.final_quality_probe = final_quality_probe
         self.class_conditioned_final_quality_probe = \
             class_conditioned_final_quality_probe
+        self.multi_threshold_class_conditioned_quality_probe = \
+            multi_threshold_class_conditioned_quality_probe
+        self.multi_threshold_quality_thresholds = tuple(
+            float(value) for value in multi_threshold_quality_thresholds)
+        if len(self.multi_threshold_quality_thresholds) != 10:
+            raise ValueError(
+                'multi_threshold_quality_thresholds must contain 10 values')
         quality_modes = sum((
             bool(decoder_quality),
             bool(final_quality_probe),
             bool(class_conditioned_final_quality_probe),
+            bool(multi_threshold_class_conditioned_quality_probe),
         ))
         if quality_modes > 1:
             raise ValueError(
@@ -441,6 +453,14 @@ class RTDETRTransformerv2(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, num_classes),
             )
+        if multi_threshold_class_conditioned_quality_probe:
+            self.multi_threshold_quality_probe_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(
+                    hidden_dim,
+                    num_classes * len(self.multi_threshold_quality_thresholds)),
+            )
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -475,6 +495,11 @@ class RTDETRTransformerv2(nn.Module):
                 self.class_conditioned_quality_probe_head[-1].weight, 0)
             init.constant_(
                 self.class_conditioned_quality_probe_head[-1].bias, 0)
+        if self.multi_threshold_class_conditioned_quality_probe:
+            init.constant_(
+                self.multi_threshold_quality_probe_head[-1].weight, 0)
+            init.constant_(
+                self.multi_threshold_quality_probe_head[-1].bias, 0)
         
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learn_query_content:
@@ -711,6 +736,8 @@ class RTDETRTransformerv2(nn.Module):
              if self.final_quality_probe
              else self.class_conditioned_quality_probe_head
              if self.class_conditioned_final_quality_probe
+             else self.multi_threshold_quality_probe_head
+             if self.multi_threshold_class_conditioned_quality_probe
              else None),
             self.query_pos_head,
             attn_mask=attn_mask)
@@ -730,6 +757,11 @@ class RTDETRTransformerv2(nn.Module):
         if out_quality_logits is not None:
             out['pred_quality_logits'] = out_quality_logits[-1]
         if final_quality_probe_logits is not None:
+            if self.multi_threshold_class_conditioned_quality_probe:
+                final_quality_probe_logits = final_quality_probe_logits.view(
+                    *final_quality_probe_logits.shape[:2],
+                    self.num_classes,
+                    len(self.multi_threshold_quality_thresholds))
             out['pred_quality_logits'] = final_quality_probe_logits
 
         if self.training and encoder_quality_outputs is not None:

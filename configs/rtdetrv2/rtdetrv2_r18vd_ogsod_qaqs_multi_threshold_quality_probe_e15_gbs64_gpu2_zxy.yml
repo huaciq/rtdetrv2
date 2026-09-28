@@ -1,0 +1,50 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_qaqs_gbs64_gpu2_zxy.yml'
+
+# Frozen original QAQS detector + final-layer [query, class, IoU threshold]
+# quality probe. Initialize detector weights with --tuning from QAQS best.pth.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_qaqs_multi_threshold_quality_probe_e15_gbs64_gpu2_zxy
+epoches: 15
+checkpoint_freq: 1
+checkpoint_metric: multi_threshold_quality_metric
+use_ema: False
+
+PResNet:
+  pretrained: False
+
+RTDETR:
+  freeze_detector_for_final_quality_probe: True
+
+RTDETRTransformerv2:
+  multi_threshold_class_conditioned_quality_probe: True
+  multi_threshold_quality_thresholds: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+
+RTDETRCriterionv2:
+  multi_threshold_class_conditioned_quality_probe: True
+  multi_threshold_quality_topk: 100
+  multi_threshold_quality_thresholds: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+  weight_dict:
+    loss_multi_threshold_quality: 1.0
+
+RTDETRPostProcessor:
+  final_score_method: multi_threshold_class_conditioned_quality
+  multi_threshold_quality_beta: 0.0
+  decoder_quality_iou_mode: multi_threshold_pairwise
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: 'decoder.multi_threshold_quality_probe_head'
+  lr: 0.001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [10]
+  gamma: 0.1
+
+lr_warmup_scheduler:
+  type: LinearWarmup
+  warmup_duration: 100

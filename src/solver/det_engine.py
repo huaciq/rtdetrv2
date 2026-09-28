@@ -20,6 +20,7 @@ from ..misc import MetricLogger, SmoothedValue, dist_utils
 from .query_stats import (
     ClassConditionedQualityProbeStats,
     FinalQualityProbeStats,
+    MultiThresholdClassConditionedQualityProbeStats,
     QueryStats,
 )
 
@@ -196,6 +197,9 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
     elif quality_diagnostic_mode == 'pairwise_class':
         probe_stats = ClassConditionedQualityProbeStats(
             query_diagnosis_output_dir)
+    elif quality_diagnostic_mode == 'multi_threshold_pairwise':
+        probe_stats = MultiThresholdClassConditionedQualityProbeStats(
+            query_diagnosis_output_dir)
     
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
@@ -281,8 +285,9 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
         if 'segm' in iou_types:
             stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
     if probe_summary is not None:
-        stats[probe_stats.metric_name] = [
-            probe_summary['pearson'], probe_summary['spearman']]
+        stats[probe_stats.metric_name] = probe_summary.get(
+            'checkpoint_metric_values',
+            [probe_summary['pearson'], probe_summary['spearman']])
             
     return stats, coco_evaluator
 

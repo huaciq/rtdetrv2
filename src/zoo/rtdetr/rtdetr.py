@@ -35,14 +35,19 @@ class RTDETR(nn.Module):
             scalar_probe = getattr(decoder, 'final_quality_probe', False)
             class_probe = getattr(
                 decoder, 'class_conditioned_final_quality_probe', False)
-            if not (scalar_probe or class_probe):
+            multi_threshold_probe = getattr(
+                decoder,
+                'multi_threshold_class_conditioned_quality_probe', False)
+            if not (scalar_probe or class_probe or multi_threshold_probe):
                 raise ValueError(
                     'freeze_detector_for_final_quality_probe requires '
                     'a final quality probe in RTDETRTransformerv2')
-            probe_head = (
-                decoder.final_quality_probe_head
-                if scalar_probe
-                else decoder.class_conditioned_quality_probe_head)
+            if scalar_probe:
+                probe_head = decoder.final_quality_probe_head
+            elif class_probe:
+                probe_head = decoder.class_conditioned_quality_probe_head
+            else:
+                probe_head = decoder.multi_threshold_quality_probe_head
             for parameter in self.parameters():
                 parameter.requires_grad_(False)
             for parameter in probe_head.parameters():
@@ -58,8 +63,12 @@ class RTDETR(nn.Module):
             self.decoder.eval()
             if getattr(self.decoder, 'final_quality_probe', False):
                 self.decoder.final_quality_probe_head.train(mode)
-            else:
+            elif getattr(
+                    self.decoder,
+                    'class_conditioned_final_quality_probe', False):
                 self.decoder.class_conditioned_quality_probe_head.train(mode)
+            else:
+                self.decoder.multi_threshold_quality_probe_head.train(mode)
         return self
         
     def forward(self, x, targets=None):

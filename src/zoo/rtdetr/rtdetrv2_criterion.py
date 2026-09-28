@@ -45,7 +45,12 @@ class RTDETRCriterionv2(nn.Module):
         final_quality_probe=False,
         final_quality_probe_topk=100,
         class_conditioned_final_quality_probe=False,
-        class_conditioned_quality_topk=100):
+        class_conditioned_quality_topk=100,
+        multi_threshold_class_conditioned_quality_probe=False,
+        multi_threshold_quality_topk=100,
+        multi_threshold_quality_thresholds=(
+            0.50, 0.55, 0.60, 0.65, 0.70,
+            0.75, 0.80, 0.85, 0.90, 0.95)):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -78,11 +83,77 @@ class RTDETRCriterionv2(nn.Module):
         self.final_quality_probe_topk = final_quality_probe_topk
         self.class_conditioned_final_quality_probe = \
             class_conditioned_final_quality_probe
-        if final_quality_probe and class_conditioned_final_quality_probe:
+        self.multi_threshold_class_conditioned_quality_probe = \
+            multi_threshold_class_conditioned_quality_probe
+        if sum((
+                bool(final_quality_probe),
+                bool(class_conditioned_final_quality_probe),
+                bool(multi_threshold_class_conditioned_quality_probe))) > 1:
             raise ValueError('Final quality probe modes are mutually exclusive')
         if class_conditioned_quality_topk <= 0:
             raise ValueError('class_conditioned_quality_topk must be positive')
         self.class_conditioned_quality_topk = class_conditioned_quality_topk
+        if multi_threshold_quality_topk <= 0:
+            raise ValueError('multi_threshold_quality_topk must be positive')
+        self.multi_threshold_quality_topk = multi_threshold_quality_topk
+        thresholds = torch.as_tensor(
+            multi_threshold_quality_thresholds, dtype=torch.float32)
+        if thresholds.numel() != 10:
+            raise ValueError(
+                'multi_threshold_quality_thresholds must contain 10 values')
+        self.register_buffer('multi_threshold_quality_thresholds', thresholds)
+
+    def loss_multi_threshold_class_conditioned_quality_probe(
+            self, outputs, targets):
+        """BCE over COCO IoU thresholds on classification Top-K pairs."""
+        quality_logits = outputs['pred_quality_logits']
+        class_logits = outputs['pred_logits']
+        decoder_boxes = outputs['pred_boxes']
+        expected_shape = (
+            *class_logits.shape, self.multi_threshold_quality_thresholds.numel())
+        if quality_logits.shape != expected_shape:
+            raise ValueError(
+                'Multi-threshold quality logits must have shape [B, Q, C, 10]')
+        if class_logits.shape[:2] != decoder_boxes.shape[:2]:
+            raise ValueError(
+                'Class logits and decoder boxes must share shape [B, Q]')
+
+        pair_count = class_logits.shape[1] * class_logits.shape[2]
+        topk = min(self.multi_threshold_quality_topk, pair_count)
+        with torch.no_grad():
+            detached_logits = class_logits.detach()
+            detached_boxes = decoder_boxes.detach()
+            sample_indices = torch.topk(
+                detached_logits.sigmoid().flatten(1), topk, dim=1).indices
+            pair_ious = []
+            for batch_index, target in enumerate(targets):
+                target_boxes = target['boxes'].as_subclass(torch.Tensor).to(
+                    device=detached_boxes.device,
+                    dtype=detached_boxes.dtype).detach()
+                target_labels = target['labels'].as_subclass(torch.Tensor).to(
+                    device=detached_logits.device, dtype=torch.long)
+                pair_ious.append(pairwise_class_max_iou(
+                    box_cxcywh_to_xyxy(detached_boxes[batch_index]),
+                    target_labels,
+                    box_cxcywh_to_xyxy(target_boxes),
+                    self.num_classes))
+            pair_ious = torch.stack(pair_ious).detach()
+            thresholds = self.multi_threshold_quality_thresholds.to(
+                device=quality_logits.device, dtype=quality_logits.dtype)
+            binary_targets = (
+                pair_ious.unsqueeze(-1) >= thresholds).to(quality_logits.dtype)
+            gather_indices = sample_indices.unsqueeze(-1).expand(
+                -1, -1, thresholds.numel())
+            sampled_targets = binary_targets.flatten(1, 2).gather(
+                1, gather_indices)
+
+        sampled_logits = quality_logits.flatten(1, 2).gather(
+            1, gather_indices)
+        return {
+            'loss_multi_threshold_quality':
+                F.binary_cross_entropy_with_logits(
+                    sampled_logits, sampled_targets)
+        }
 
     def loss_class_conditioned_final_quality_probe(self, outputs, targets):
         """Quality-Focal loss on classification Top-K query-class pairs."""
@@ -372,6 +443,16 @@ class RTDETRCriterionv2(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        if self.multi_threshold_class_conditioned_quality_probe:
+            probe_losses = \
+                self.loss_multi_threshold_class_conditioned_quality_probe(
+                    outputs, targets)
+            return {
+                key: value * self.weight_dict[key]
+                for key, value in probe_losses.items()
+                if key in self.weight_dict
+            }
+
         if self.class_conditioned_final_quality_probe:
             probe_losses = self.loss_class_conditioned_final_quality_probe(
                 outputs, targets)

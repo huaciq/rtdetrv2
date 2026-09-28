@@ -1384,3 +1384,169 @@ class ClassConditionedQualityProbeStats:
             if print_output:
                 print(f'  JSON: {output_path}')
         return summary
+
+
+class MultiThresholdClassConditionedQualityProbeStats:
+    """Top-pair diagnostics for COCO-threshold quality probabilities."""
+
+    TOPK = 100
+    THRESHOLDS = (
+        0.50, 0.55, 0.60, 0.65, 0.70,
+        0.75, 0.80, 0.85, 0.90, 0.95,
+    )
+    metric_name = 'multi_threshold_quality_metric'
+
+    def __init__(self, output_dir=None):
+        self.output_dir = Path(output_dir) if output_dir is not None else None
+        self.probabilities = []
+        self.ious = []
+
+    def update(self, outputs, targets, image_hw):
+        quality_logits = outputs.get('pred_quality_logits')
+        if quality_logits is None:
+            raise KeyError(
+                'Multi-threshold diagnostics require pred_quality_logits')
+        class_logits = outputs['pred_logits']
+        boxes = outputs['pred_boxes']
+        if (quality_logits.ndim != 4
+                or quality_logits.shape[:3] != class_logits.shape
+                or quality_logits.shape[-1] != len(self.THRESHOLDS)):
+            raise ValueError(
+                'Multi-threshold quality logits must have shape [B, Q, C, 10]')
+        if class_logits.shape[:2] != boxes.shape[:2]:
+            raise ValueError('pred_logits and pred_boxes must share [B, Q]')
+
+        image_h, image_w = image_hw
+        pred_xyxy = box_cxcywh_to_xyxy(boxes.detach().float())
+        for batch_index, target in enumerate(targets):
+            target_boxes = target['boxes'].as_subclass(torch.Tensor).to(
+                device=pred_xyxy.device, dtype=pred_xyxy.dtype)
+            box_format = getattr(target['boxes'], 'format', None)
+            if box_format is not None and 'XYXY' not in str(box_format).upper():
+                raise ValueError(
+                    'Probe validation expects GT in pixel-space XYXY')
+            scale = target_boxes.new_tensor(
+                [image_w, image_h, image_w, image_h])
+            target_boxes = target_boxes / scale
+            target_labels = target['labels'].as_subclass(torch.Tensor).to(
+                device=class_logits.device, dtype=torch.long)
+            true_quality = pairwise_class_max_iou(
+                pred_xyxy[batch_index], target_labels, target_boxes,
+                class_logits.shape[-1])
+            pair_scores = class_logits[batch_index].detach().sigmoid().flatten()
+            count = min(self.TOPK, pair_scores.numel())
+            indices = torch.topk(pair_scores, count, dim=0).indices
+            probabilities = quality_logits[batch_index].sigmoid().detach()
+            probabilities = probabilities.flatten(0, 1)[indices]
+            self.probabilities.append(probabilities.float().cpu())
+            self.ious.append(
+                true_quality.detach().flatten()[indices].float().cpu())
+
+    def synchronize_between_processes(self):
+        probabilities = (
+            torch.cat(self.probabilities)
+            if self.probabilities else torch.empty((0, len(self.THRESHOLDS))))
+        ious = torch.cat(self.ious) if self.ious else torch.empty(0)
+        if (torch.distributed.is_available()
+                and torch.distributed.is_initialized()):
+            gathered = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(
+                gathered, (probabilities, ious))
+            probabilities = torch.cat([item[0] for item in gathered])
+            ious = torch.cat([item[1] for item in gathered])
+        self.probabilities = [probabilities]
+        self.ious = [ious]
+
+    @staticmethod
+    def _auroc(scores, labels):
+        positives = int(labels.sum().item())
+        negatives = int(labels.numel() - positives)
+        if positives == 0 or negatives == 0:
+            return None
+        ranks = QueryStats._average_ranks(scores)
+        positive_rank_sum = ranks[labels].sum().item()
+        value = (
+            positive_rank_sum - positives * (positives - 1) / 2
+        ) / (positives * negatives)
+        return float(value)
+
+    def summarize(self, write_output=True, print_output=True):
+        probabilities = (
+            torch.cat(self.probabilities)
+            if self.probabilities else torch.empty((0, len(self.THRESHOLDS))))
+        ious = torch.cat(self.ious) if self.ious else torch.empty(0)
+        threshold_metrics = {}
+        aurocs = []
+        if print_output:
+            print('\nMulti-Threshold Quality, Classification Top-100 Pairs:')
+        for index, threshold in enumerate(self.THRESHOLDS):
+            labels = ious >= threshold
+            positive_count = int(labels.sum().item())
+            negative_count = int(labels.numel() - positive_count)
+            auroc = self._auroc(probabilities[:, index], labels)
+            if auroc is not None:
+                aurocs.append(auroc)
+            positive_mean = (
+                float(probabilities[labels, index].mean().item())
+                if positive_count else None)
+            negative_mean = (
+                float(probabilities[~labels, index].mean().item())
+                if negative_count else None)
+            key = f'{threshold:.2f}'
+            threshold_metrics[key] = {
+                'auroc': auroc,
+                'positive_count': positive_count,
+                'negative_count': negative_count,
+                'positive_mean_probability': positive_mean,
+                'negative_mean_probability': negative_mean,
+            }
+            if print_output:
+                print(
+                    f'IoU >= {key}: AUROC={QueryStats._format_metric(auroc)}, '
+                    f'pos_mean={QueryStats._format_metric(positive_mean)}, '
+                    f'neg_mean={QueryStats._format_metric(negative_mean)}, '
+                    f'pos={positive_count}, neg={negative_count}')
+
+        coco_quality = probabilities.mean(dim=-1)
+        overall = FinalQualityProbeStats._correlation_summary(
+            coco_quality, ious)
+        conditional = {}
+        for threshold in (0.5, 0.75):
+            mask = ious > threshold
+            correlation = FinalQualityProbeStats._correlation_summary(
+                coco_quality[mask], ious[mask])
+            conditional[f'true_quality > {threshold:g}'] = correlation
+            if print_output:
+                print(
+                    f'IoU > {threshold:g} correlation '
+                    f'(n={correlation["sample_count"]}): '
+                    f'Pearson={QueryStats._format_metric(correlation["pearson"])}, '
+                    f'Spearman={QueryStats._format_metric(correlation["spearman"])}')
+
+        mean_auroc = sum(aurocs) / len(aurocs) if aurocs else None
+        checkpoint_value = mean_auroc if mean_auroc is not None else float('-inf')
+        summary = {
+            **overall,
+            'mean_auroc': mean_auroc,
+            'checkpoint_metric_values': [checkpoint_value],
+            'thresholds': list(self.THRESHOLDS),
+            'threshold_metrics': threshold_metrics,
+            'conditional_correlations': conditional,
+            'selection': (
+                'per image Top-100 over flattened '
+                'sigmoid(detached final_logits)[query,class] pairs'),
+            'target_definition': (
+                'target[i,c,k] = 1 when max IoU(final bbox i, GT boxes of '
+                'class c) >= COCO threshold k, otherwise 0'),
+            'coco_quality_definition': (
+                'mean sigmoid quality probability over thresholds 0.50:0.05:0.95'),
+        }
+        if write_output and self.output_dir is not None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = (
+                self.output_dir / 'multi_threshold_quality_alignment.json')
+            with output_path.open('w', encoding='utf-8') as file:
+                json.dump(summary, file, indent=2)
+            if print_output:
+                print(f'  JSON: {output_path}')
+        return summary
