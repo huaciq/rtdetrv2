@@ -1,0 +1,17 @@
+__include__:
+  - './rtdetrv2_r18vd_ogsod_qaqs_class_conditioned_quality_probe_e15_gbs64_gpu2_zxy.yml'
+
+# Frozen QAQS detector; fine-tune only the scalar [query, class] probe with
+# soft-IoU regression plus lambda_rank=1.0 deterministic RankNet supervision.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_qaqs_class_conditioned_quality_ranking_lambda10_e15_gbs64_gpu2_zxy
+checkpoint_metric: class_conditioned_quality_ranking_metric
+
+RTDETRCriterionv2:
+  class_conditioned_rank_min_iou_gap: 0.1
+  class_conditioned_rank_max_pairs_per_image_class: 256
+  weight_dict:
+    loss_class_conditioned_quality: 1.0
+    loss_class_conditioned_rank: 1.0
+
+RTDETRPostProcessor:
+  decoder_quality_iou_mode: pairwise_class_ranking

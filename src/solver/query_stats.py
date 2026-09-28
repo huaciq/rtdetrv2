@@ -1254,10 +1254,16 @@ class ClassConditionedQualityProbeStats:
     HIGH_IOU_BINS = FinalQualityProbeStats.HIGH_IOU_BINS
     metric_name = 'class_conditioned_quality_correlation'
 
-    def __init__(self, output_dir=None):
+    def __init__(self, output_dir=None, ranking_enhanced=False):
         self.output_dir = Path(output_dir) if output_dir is not None else None
+        self.ranking_enhanced = ranking_enhanced
+        if ranking_enhanced:
+            self.metric_name = 'class_conditioned_quality_ranking_metric'
         self.scores = []
         self.ious = []
+        self.ranking_same = 0
+        self.ranking_total = 0
+        self.ranking_regrets = []
 
     def update(self, outputs, targets, image_hw):
         quality_logits = outputs.get('pred_quality_logits')
@@ -1295,23 +1301,56 @@ class ClassConditionedQualityProbeStats:
             pair_scores = class_logits[batch_index].detach().sigmoid().flatten()
             count = min(self.TOPK, pair_scores.numel())
             indices = torch.topk(pair_scores, count, dim=0).indices
-            self.scores.append(
+            selected_scores = (
                 quality_logits[batch_index].sigmoid().detach().flatten()[
-                    indices].float().cpu())
-            self.ious.append(
-                true_quality.detach().flatten()[indices].float().cpu())
+                    indices])
+            selected_ious = true_quality.detach().flatten()[indices]
+            self.scores.append(selected_scores.float().cpu())
+            self.ious.append(selected_ious.float().cpu())
+
+            if self.ranking_enhanced:
+                selected_classes = indices % class_logits.shape[-1]
+                for class_id in target_labels.unique(sorted=True):
+                    class_mask = selected_classes == class_id
+                    if int(class_mask.sum().item()) < 2:
+                        continue
+                    class_scores = selected_scores[class_mask]
+                    class_ious = selected_ious[class_mask]
+                    best_true = class_ious.argmax()
+                    best_predicted = class_scores.argmax()
+                    self.ranking_same += int(
+                        best_true.item() == best_predicted.item())
+                    self.ranking_total += 1
+                    regret = (
+                        class_ious[best_true] - class_ious[best_predicted]
+                    ).clamp_min(0)
+                    self.ranking_regrets.append(
+                        regret.detach().float().cpu().reshape(1))
 
     def synchronize_between_processes(self):
         scores = torch.cat(self.scores) if self.scores else torch.empty(0)
         ious = torch.cat(self.ious) if self.ious else torch.empty(0)
+        regrets = (
+            torch.cat(self.ranking_regrets)
+            if self.ranking_regrets else torch.empty(0))
+        ranking_same = self.ranking_same
+        ranking_total = self.ranking_total
         if (torch.distributed.is_available()
                 and torch.distributed.is_initialized()):
             gathered = [None] * torch.distributed.get_world_size()
-            torch.distributed.all_gather_object(gathered, (scores, ious))
+            torch.distributed.all_gather_object(
+                gathered,
+                (scores, ious, regrets, ranking_same, ranking_total))
             scores = torch.cat([item[0] for item in gathered])
             ious = torch.cat([item[1] for item in gathered])
+            regrets = torch.cat([item[2] for item in gathered])
+            ranking_same = sum(item[3] for item in gathered)
+            ranking_total = sum(item[4] for item in gathered)
         self.scores = [scores]
         self.ious = [ious]
+        self.ranking_regrets = [regrets]
+        self.ranking_same = ranking_same
+        self.ranking_total = ranking_total
 
     def summarize(self, write_output=True, print_output=True):
         scores = torch.cat(self.scores) if self.scores else torch.empty(0)
@@ -1363,6 +1402,57 @@ class ClassConditionedQualityProbeStats:
                 print(f'{label}: mean predicted quality={predicted_text}, '
                       f'mean true quality={true_text}, n={count}')
 
+        ranking = None
+        checkpoint_metric_values = None
+        if self.ranking_enhanced:
+            regrets = (
+                torch.cat(self.ranking_regrets)
+                if self.ranking_regrets else torch.empty(0))
+            same_query_rate = (
+                self.ranking_same / self.ranking_total
+                if self.ranking_total else None)
+            mean_regret = (
+                float(regrets.mean().item()) if regrets.numel() else None)
+            median_regret = (
+                float(torch.quantile(regrets, 0.5).item())
+                if regrets.numel() else None)
+            p90_regret = (
+                float(torch.quantile(regrets, 0.9).item())
+                if regrets.numel() else None)
+            ranking_score = (
+                same_query_rate - mean_regret
+                if same_query_rate is not None and mean_regret is not None
+                else float('-inf'))
+            ranking = {
+                'evaluated_image_classes': self.ranking_total,
+                'same_query_count': self.ranking_same,
+                'same_query_rate': same_query_rate,
+                'mean_iou_regret': mean_regret,
+                'median_iou_regret': median_regret,
+                'p90_iou_regret': p90_regret,
+                'checkpoint_ranking_score': ranking_score,
+                'checkpoint_ranking_score_formula': (
+                    'same_query_rate - mean_iou_regret'),
+                'candidate_definition': (
+                    'pairs of each GT-present class inside the per-image '
+                    'classification Top-100 flattened query-class pairs; '
+                    'classes require at least two candidates'),
+            }
+            checkpoint_metric_values = [
+                ranking_score,
+                overall['spearman'],
+                conditions['true_quality > 0.5']['spearman'],
+                conditions['true_quality > 0.75']['spearman'],
+            ]
+            if print_output:
+                print('\nPer-Image / Per-Class Ranking:')
+                print(
+                    f'same-query={self.ranking_same}/{self.ranking_total} '
+                    f'({QueryStats._format_metric(same_query_rate)}), '
+                    f'regret mean={QueryStats._format_metric(mean_regret)}, '
+                    f'median={QueryStats._format_metric(median_regret)}, '
+                    f'P90={QueryStats._format_metric(p90_regret)}')
+
         summary = {
             **overall,
             'selection': (
@@ -1374,6 +1464,9 @@ class ClassConditionedQualityProbeStats:
             'conditional_correlations': conditions,
             'high_quality_bins': bins,
         }
+        if ranking is not None:
+            summary['per_image_per_class_ranking'] = ranking
+            summary['checkpoint_metric_values'] = checkpoint_metric_values
         if write_output and self.output_dir is not None:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             output_path = (

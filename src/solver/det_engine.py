@@ -197,6 +197,9 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
     elif quality_diagnostic_mode == 'pairwise_class':
         probe_stats = ClassConditionedQualityProbeStats(
             query_diagnosis_output_dir)
+    elif quality_diagnostic_mode == 'pairwise_class_ranking':
+        probe_stats = ClassConditionedQualityProbeStats(
+            query_diagnosis_output_dir, ranking_enhanced=True)
     elif quality_diagnostic_mode == 'multi_threshold_pairwise':
         probe_stats = MultiThresholdClassConditionedQualityProbeStats(
             query_diagnosis_output_dir)

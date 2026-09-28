@@ -46,6 +46,8 @@ class RTDETRCriterionv2(nn.Module):
         final_quality_probe_topk=100,
         class_conditioned_final_quality_probe=False,
         class_conditioned_quality_topk=100,
+        class_conditioned_rank_min_iou_gap=0.1,
+        class_conditioned_rank_max_pairs_per_image_class=256,
         multi_threshold_class_conditioned_quality_probe=False,
         multi_threshold_quality_topk=100,
         multi_threshold_quality_thresholds=(
@@ -93,6 +95,17 @@ class RTDETRCriterionv2(nn.Module):
         if class_conditioned_quality_topk <= 0:
             raise ValueError('class_conditioned_quality_topk must be positive')
         self.class_conditioned_quality_topk = class_conditioned_quality_topk
+        if class_conditioned_rank_min_iou_gap <= 0:
+            raise ValueError(
+                'class_conditioned_rank_min_iou_gap must be positive')
+        self.class_conditioned_rank_min_iou_gap = float(
+            class_conditioned_rank_min_iou_gap)
+        if class_conditioned_rank_max_pairs_per_image_class <= 0:
+            raise ValueError(
+                'class_conditioned_rank_max_pairs_per_image_class must be '
+                'positive')
+        self.class_conditioned_rank_max_pairs_per_image_class = int(
+            class_conditioned_rank_max_pairs_per_image_class)
         if multi_threshold_quality_topk <= 0:
             raise ValueError('multi_threshold_quality_topk must be positive')
         self.multi_threshold_quality_topk = multi_threshold_quality_topk
@@ -214,10 +227,56 @@ class RTDETRCriterionv2(nn.Module):
         modulation = (sampled_targets - probabilities).abs().square()
         element_loss = F.binary_cross_entropy_with_logits(
             sampled_logits, sampled_targets, reduction='none')
-        return {
+        losses = {
             'loss_class_conditioned_quality': (
                 modulation * element_loss).mean()
         }
+        if 'loss_class_conditioned_rank' in self.weight_dict:
+            rank_losses = []
+            num_classes = class_logits.shape[-1]
+            flat_quality_logits = quality_logits.flatten(1)
+            flat_quality_targets = quality_targets.flatten(1)
+            for batch_index in range(class_logits.shape[0]):
+                selected_indices = sample_indices[batch_index]
+                selected_classes = selected_indices % num_classes
+                selected_logits = flat_quality_logits[
+                    batch_index, selected_indices]
+                selected_targets = flat_quality_targets[
+                    batch_index, selected_indices]
+                for class_id in selected_classes.unique(sorted=True):
+                    class_mask = selected_classes == class_id
+                    class_logits_selected = selected_logits[class_mask]
+                    class_targets_selected = selected_targets[class_mask]
+                    if class_targets_selected.numel() < 2:
+                        continue
+                    target_differences = (
+                        class_targets_selected[:, None]
+                        - class_targets_selected[None, :])
+                    valid_pairs = torch.nonzero(
+                        target_differences
+                        >= self.class_conditioned_rank_min_iou_gap,
+                        as_tuple=False)
+                    if valid_pairs.numel() == 0:
+                        continue
+                    max_pairs = (
+                        self.class_conditioned_rank_max_pairs_per_image_class)
+                    if valid_pairs.shape[0] > max_pairs:
+                        # Deterministic uniform subsampling prevents O(N^2)
+                        # growth without introducing per-rank RNG differences.
+                        positions = torch.linspace(
+                            0, valid_pairs.shape[0] - 1,
+                            steps=max_pairs,
+                            device=valid_pairs.device).round().long()
+                        valid_pairs = valid_pairs[positions]
+                    higher_logits = class_logits_selected[valid_pairs[:, 0]]
+                    lower_logits = class_logits_selected[valid_pairs[:, 1]]
+                    rank_losses.append(F.softplus(
+                        -(higher_logits - lower_logits)))
+            losses['loss_class_conditioned_rank'] = (
+                torch.cat(rank_losses).mean()
+                if rank_losses
+                else quality_logits.sum() * 0.0)
+        return losses
 
     def loss_final_quality_probe(self, outputs, targets):
         """Quality-Focal soft-IoU loss on top-scoring final queries only."""

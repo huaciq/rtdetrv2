@@ -68,11 +68,11 @@ class RTDETRPostProcessor(nn.Module):
             multi_threshold_quality_beta)
         if decoder_quality_iou_mode not in (
                 'class_agnostic', 'predicted_class', 'pairwise_class',
-                'multi_threshold_pairwise'):
+                'pairwise_class_ranking', 'multi_threshold_pairwise'):
             raise ValueError(
                 'decoder_quality_iou_mode must be class_agnostic, '
-                'predicted_class, pairwise_class, or '
-                'multi_threshold_pairwise')
+                'predicted_class, pairwise_class, '
+                'pairwise_class_ranking, or multi_threshold_pairwise')
         self.decoder_quality_iou_mode = decoder_quality_iou_mode
         active_rerankers = sum(gamma != 0.0 for gamma in (
             self.final_quality_gamma,
