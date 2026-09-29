@@ -41,6 +41,9 @@ class RTDETRPostProcessor(nn.Module):
         final_score_method='default',
         decoder_quality_beta=1.0,
         class_conditioned_quality_beta=1.0,
+        class_conditioned_quality_fusion='product',
+        class_conditioned_quality_alpha=0.0,
+        class_conditioned_quality_tau=0.0,
         multi_threshold_quality_beta=1.0,
         decoder_quality_iou_mode='class_agnostic',
     ) -> None:
@@ -64,6 +67,28 @@ class RTDETRPostProcessor(nn.Module):
         self.decoder_quality_beta = float(decoder_quality_beta)
         self.class_conditioned_quality_beta = float(
             class_conditioned_quality_beta)
+        if class_conditioned_quality_fusion not in (
+                'product', 'geometric', 'linear', 'gated_product'):
+            raise ValueError(
+                'class_conditioned_quality_fusion must be product, '
+                'geometric, linear, or gated_product')
+        self.class_conditioned_quality_fusion = \
+            class_conditioned_quality_fusion
+        self.class_conditioned_quality_alpha = float(
+            class_conditioned_quality_alpha)
+        self.class_conditioned_quality_tau = float(
+            class_conditioned_quality_tau)
+        if not 0.0 <= self.class_conditioned_quality_alpha <= 1.0:
+            raise ValueError(
+                'class_conditioned_quality_alpha must be in [0, 1]')
+        if not 0.0 <= self.class_conditioned_quality_tau <= 1.0:
+            raise ValueError(
+                'class_conditioned_quality_tau must be in [0, 1]')
+        self.class_conditioned_quality_enabled = (
+            self.class_conditioned_quality_beta != 0.0
+            if self.class_conditioned_quality_fusion in (
+                'product', 'gated_product')
+            else self.class_conditioned_quality_alpha != 0.0)
         self.multi_threshold_quality_beta = float(
             multi_threshold_quality_beta)
         if decoder_quality_iou_mode not in (
@@ -84,7 +109,7 @@ class RTDETRPostProcessor(nn.Module):
                 and self.decoder_quality_beta != 0.0):
             active_rerankers += 1
         if (self.final_score_method == 'class_conditioned_quality'
-                and self.class_conditioned_quality_beta != 0.0):
+                and self.class_conditioned_quality_enabled):
             active_rerankers += 1
         if (self.final_score_method ==
                 'multi_threshold_class_conditioned_quality'
@@ -110,6 +135,12 @@ class RTDETRPostProcessor(nn.Module):
                 f'decoder_quality_beta={self.decoder_quality_beta}, '
                 'class_conditioned_quality_beta='
                 f'{self.class_conditioned_quality_beta}, '
+                'class_conditioned_quality_fusion='
+                f'{self.class_conditioned_quality_fusion}, '
+                'class_conditioned_quality_alpha='
+                f'{self.class_conditioned_quality_alpha}, '
+                'class_conditioned_quality_tau='
+                f'{self.class_conditioned_quality_tau}, '
                 'multi_threshold_quality_beta='
                 f'{self.multi_threshold_quality_beta}, '
                 f'decoder_quality_iou_mode={self.decoder_quality_iou_mode}')
@@ -193,7 +224,7 @@ class RTDETRPostProcessor(nn.Module):
                 scores = scores * decoder_quality.pow(
                     self.decoder_quality_beta)
             elif (self.final_score_method == 'class_conditioned_quality'
-                    and self.class_conditioned_quality_beta != 0.0):
+                    and self.class_conditioned_quality_enabled):
                 if 'pred_quality_logits' not in outputs:
                     raise KeyError(
                         'class-conditioned quality scoring requires '
@@ -203,8 +234,23 @@ class RTDETRPostProcessor(nn.Module):
                     raise ValueError(
                         'Class-conditioned pred_quality_logits must have '
                         'shape [B, Q, C] matching classification scores')
-                scores = scores * quality_logits.sigmoid().pow(
-                    self.class_conditioned_quality_beta)
+                quality = quality_logits.sigmoid()
+                if self.class_conditioned_quality_fusion == 'product':
+                    scores = scores * quality.pow(
+                        self.class_conditioned_quality_beta)
+                elif self.class_conditioned_quality_fusion == 'geometric':
+                    alpha = self.class_conditioned_quality_alpha
+                    scores = scores.pow(1.0 - alpha) * quality.pow(alpha)
+                elif self.class_conditioned_quality_fusion == 'linear':
+                    alpha = self.class_conditioned_quality_alpha
+                    scores = (1.0 - alpha) * scores + alpha * quality
+                else:
+                    fused_scores = scores * quality.pow(
+                        self.class_conditioned_quality_beta)
+                    scores = torch.where(
+                        scores >= self.class_conditioned_quality_tau,
+                        fused_scores,
+                        scores)
             elif (self.final_score_method ==
                     'multi_threshold_class_conditioned_quality'
                     and self.multi_threshold_quality_beta != 0.0):

@@ -1,0 +1,14 @@
+__include__:
+  - './rtdetrv2_r18vd_ogsod_qaqs_class_conditioned_quality_probe_e15_gbs64_gpu2_zxy.yml'
+
+# Inference-only score-fusion diagnostic. Load the selected frozen scalar
+# class-conditioned quality probe checkpoint with --resume.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_qaqs_class_conditioned_quality_score_fusion
+
+RTDETRPostProcessor:
+  final_score_method: class_conditioned_quality
+  class_conditioned_quality_fusion: product
+  class_conditioned_quality_beta: 0.0
+  class_conditioned_quality_alpha: 0.0
+  class_conditioned_quality_tau: 0.0
+  decoder_quality_iou_mode: pairwise_class_ranking
