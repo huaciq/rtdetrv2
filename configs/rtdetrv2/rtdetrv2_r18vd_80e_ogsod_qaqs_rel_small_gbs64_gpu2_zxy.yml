@@ -1,0 +1,19 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_qaqs_gbs64_gpu2_zxy.yml'
+
+# QAQS + small-target relative localization loss. All data, optimization,
+# augmentation, seed, and 80-epoch schedule settings remain identical to QAQS.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_80e_qaqs_rel_small_w05_gbs64_gpu2_zxy
+
+RTDETRCriterionv2:
+  relative_small_loss: True
+  relative_small_reference_size: 640.0
+  relative_small_threshold_px: 32.0
+  relative_small_min_scale_px: 4.0
+  weight_dict: {
+    loss_vfl: 1,
+    loss_bbox: 5,
+    loss_giou: 2,
+    loss_quality: 1.0,
+    loss_rel_small: 0.5
+  }

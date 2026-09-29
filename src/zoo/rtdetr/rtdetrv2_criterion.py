@@ -52,7 +52,11 @@ class RTDETRCriterionv2(nn.Module):
         multi_threshold_quality_topk=100,
         multi_threshold_quality_thresholds=(
             0.50, 0.55, 0.60, 0.65, 0.70,
-            0.75, 0.80, 0.85, 0.90, 0.95)):
+            0.75, 0.80, 0.85, 0.90, 0.95),
+        relative_small_loss=False,
+        relative_small_reference_size=640.0,
+        relative_small_threshold_px=32.0,
+        relative_small_min_scale_px=4.0):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -106,6 +110,19 @@ class RTDETRCriterionv2(nn.Module):
                 'positive')
         self.class_conditioned_rank_max_pairs_per_image_class = int(
             class_conditioned_rank_max_pairs_per_image_class)
+        self.relative_small_loss = bool(relative_small_loss)
+        if relative_small_reference_size <= 0:
+            raise ValueError('relative_small_reference_size must be positive')
+        if relative_small_threshold_px <= 0:
+            raise ValueError('relative_small_threshold_px must be positive')
+        if relative_small_min_scale_px <= 0:
+            raise ValueError('relative_small_min_scale_px must be positive')
+        self.relative_small_reference_size = float(
+            relative_small_reference_size)
+        self.relative_small_threshold_px = float(
+            relative_small_threshold_px)
+        self.relative_small_min_scale_px = float(
+            relative_small_min_scale_px)
         if multi_threshold_quality_topk <= 0:
             raise ValueError('multi_threshold_quality_topk must be positive')
         self.multi_threshold_quality_topk = multi_threshold_quality_topk
@@ -491,6 +508,39 @@ class RTDETRCriterionv2(nn.Module):
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
+    def loss_relative_small_boxes(
+            self, outputs, targets, indices, num_boxes):
+        """Relative Smooth-L1 loss for matched small-object boxes only.
+
+        Predictions and targets are normalized ``cxcywh``.  Small-object
+        membership and the minimum normalization scale are defined at the
+        configured square reference input size.  Empty selections use a sum
+        reduction, producing a differentiable zero rather than a NaN.
+        """
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([
+            target['boxes'][target_indices]
+            for target, (_, target_indices) in zip(targets, indices)
+        ], dim=0)
+
+        target_size_px = torch.sqrt(
+            target_boxes[:, 2] * target_boxes[:, 3]
+        ) * self.relative_small_reference_size
+        small_mask = target_size_px < self.relative_small_threshold_px
+
+        min_scale = (
+            self.relative_small_min_scale_px /
+            self.relative_small_reference_size)
+        scale = target_boxes[:, [2, 3, 2, 3]].clamp(min=min_scale)
+        relative_error = (src_boxes - target_boxes) / scale
+        selected_error = relative_error[small_mask]
+        loss = F.smooth_l1_loss(
+            selected_error, torch.zeros_like(selected_error),
+            reduction='sum')
+        return {'loss_rel_small': loss / num_boxes}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -567,6 +617,16 @@ class RTDETRCriterionv2(nn.Module):
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
 
+        if (self.relative_small_loss
+                and 'loss_rel_small' in self.weight_dict):
+            relative_losses = self.loss_relative_small_boxes(
+                outputs, targets, indices, num_boxes)
+            losses.update({
+                key: value * self.weight_dict[key]
+                for key, value in relative_losses.items()
+                if key in self.weight_dict
+            })
+
         if ('enc_quality_logits' in outputs
                 and 'loss_quality' in self.weight_dict):
             quality_losses = self.loss_quality(outputs, targets)
@@ -598,6 +658,15 @@ class RTDETRCriterionv2(nn.Module):
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f'_aux_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+                if (self.relative_small_loss
+                        and 'loss_rel_small' in self.weight_dict):
+                    relative_losses = self.loss_relative_small_boxes(
+                        aux_outputs, targets, indices, num_boxes)
+                    losses.update({
+                        key + f'_aux_{i}': value * self.weight_dict[key]
+                        for key, value in relative_losses.items()
+                        if key in self.weight_dict
+                    })
                 if ('pred_quality_logits' in aux_outputs
                         and 'loss_decoder_quality' in self.weight_dict):
                     quality_indices = indices
