@@ -23,6 +23,7 @@ from .query_stats import (
     MultiThresholdClassConditionedQualityProbeStats,
     QueryStats,
 )
+from .query_selection_metrics import QuerySelectionMetrics
 
 
 def optimized_loss(loss_dict):
@@ -179,7 +180,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 @torch.no_grad()
 def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
              data_loader, coco_evaluator: CocoEvaluator, device,
-             query_diagnosis_output_dir=None):
+             query_diagnosis_output_dir=None, query_selection_metrics=False):
     model.eval()
     criterion.eval()
     coco_evaluator.cleanup()
@@ -189,6 +190,7 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
     header = 'Test:'
     query_stats = None
     query_stats_skipped = False
+    selection_stats = QuerySelectionMetrics() if query_selection_metrics else None
     probe_stats = None
     quality_diagnostic_mode = getattr(
         postprocessor, 'decoder_quality_iou_mode', 'class_agnostic')
@@ -209,6 +211,9 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
+
+        if selection_stats is not None:
+            selection_stats.update(outputs, targets, samples.shape[-2:])
 
         if probe_stats is not None:
             probe_stats.update(outputs, targets, samples.shape[-2:])
@@ -281,6 +286,8 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor,
         query_stats.summarize()
 
     stats = {}
+    if selection_stats is not None:
+        stats['query_selection_metrics'] = selection_stats.summarize()
     # stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     if coco_evaluator is not None:
         if 'bbox' in iou_types:

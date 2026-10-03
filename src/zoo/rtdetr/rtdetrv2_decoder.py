@@ -13,6 +13,7 @@ import torch.nn.init as init
 from typing import List
 
 from .denoising import get_contrastive_denoising_training_group
+from .sar_quality import SARQualityHead
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
 
@@ -343,7 +344,9 @@ class RTDETRTransformerv2(nn.Module):
                  multi_threshold_class_conditioned_quality_probe=False,
                  multi_threshold_quality_thresholds=(
                      0.50, 0.55, 0.60, 0.65, 0.70,
-                     0.75, 0.80, 0.85, 0.90, 0.95)):
+                     0.75, 0.80, 0.85, 0.90, 0.95),
+                 sar_quality=False,
+                 sar_quality_pool_size=3):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -368,6 +371,11 @@ class RTDETRTransformerv2(nn.Module):
         self.query_select_method = query_select_method
         self.quality_alpha = quality_alpha
         self.quality_beta = quality_beta
+        self.sar_quality = sar_quality
+        if sar_quality and (query_select_method != 'quality' or quality_alpha != 1.0):
+            raise ValueError('SQ-QS requires quality selection and quality_alpha=1')
+        if sar_quality and (not math.isfinite(quality_beta) or quality_beta < 0):
+            raise ValueError('SQ-QS quality_beta must be finite and nonnegative')
         self.decoder_quality = decoder_quality
         self.decoder_quality_detach = decoder_quality_detach
         self.final_quality_probe = final_quality_probe
@@ -389,6 +397,8 @@ class RTDETRTransformerv2(nn.Module):
         if quality_modes > 1:
             raise ValueError(
                 'decoder quality modes are mutually exclusive')
+        if sar_quality and quality_modes:
+            raise ValueError('SQ-QS changes encoder quality only; disable decoder probes')
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -469,6 +479,11 @@ class RTDETRTransformerv2(nn.Module):
             self.register_buffer('valid_mask', valid_mask)
 
         self._reset_parameters()
+        if sar_quality:
+            # Construct after all ordinary detector parameters have been
+            # initialized: identical seed preserves their E1 initialization.
+            with torch.random.fork_rng(devices=[]):
+                self.enc_quality_head = SARQualityHead(hidden_dim, sar_quality_pool_size)
         
     def _reset_parameters(self):
         bias = bias_init_with_prob(0.01)
@@ -476,8 +491,11 @@ class RTDETRTransformerv2(nn.Module):
         init.constant_(self.enc_bbox_head.layers[-1].weight, 0)
         init.constant_(self.enc_bbox_head.layers[-1].bias, 0)
         if self.query_select_method == 'quality':
-            init.constant_(self.enc_quality_head.weight, 0)
-            init.constant_(self.enc_quality_head.bias, 0)
+            quality_head = self.enc_quality_head
+            if isinstance(quality_head, SARQualityHead):
+                quality_head = quality_head.proj
+            init.constant_(quality_head.weight, 0)
+            init.constant_(quality_head.bias, 0)
 
         for _cls, _reg in zip(self.dec_score_head, self.dec_bbox_head):
             init.constant_(_cls.bias, bias)
@@ -602,9 +620,13 @@ class RTDETRTransformerv2(nn.Module):
         output_memory :torch.Tensor = self.enc_output(memory)
         enc_outputs_logits :torch.Tensor = self.enc_score_head(output_memory)
         enc_outputs_coord_unact :torch.Tensor = self.enc_bbox_head(output_memory) + anchors
-        enc_quality_logits = (
-            self.enc_quality_head(output_memory)
-            if self.query_select_method == 'quality' else None)
+        enc_quality_logits = None
+        if self.query_select_method == 'quality':
+            if self.sar_quality:
+                enc_quality_logits = self.enc_quality_head(
+                    output_memory, enc_outputs_coord_unact, spatial_shapes)
+            else:
+                enc_quality_logits = self.enc_quality_head(output_memory)
 
         enc_topk_bboxes_list, enc_topk_logits_list = [], []
         (enc_topk_memory, enc_topk_logits, enc_topk_bbox_unact,

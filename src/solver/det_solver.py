@@ -169,7 +169,9 @@ class DetSolver(BaseSolver):
         module = self.ema.module if self.ema else self.model
         test_stats, coco_evaluator = evaluate(module, self.criterion, self.postprocessor,
                 self.val_dataloader, self.evaluator, self.device,
-                query_diagnosis_output_dir=self.output_dir / 'query_diagnosis')
+                query_diagnosis_output_dir=self.output_dir / 'query_diagnosis',
+                query_selection_metrics=self.cfg.yaml_cfg.get(
+                    'query_selection_metrics', False))
                 
         if self.output_dir:
             dist_utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")
@@ -184,5 +186,19 @@ class DetSolver(BaseSolver):
                 with (self.output_dir / 'evaluation_metrics.json').open(
                         'w', encoding='utf-8') as file:
                     json.dump(metrics, file, indent=2)
+                if 'query_selection_metrics' in test_stats:
+                    focused = {name: metrics[name] for name in ('AP', 'AP50', 'AP75', 'APs')}
+                    focused.update(test_stats['query_selection_metrics'])
+                    focused['config'] = self.cfg.yaml_cfg
+                    focused['checkpoint'] = self.cfg.resume
+                    focused['weights'] = 'ema' if self.ema else 'model'
+                    focused['gpu_process_count'] = dist_utils.get_world_size()
+                    path = self.output_dir / 'query_selection_metrics.json'
+                    with path.open('w', encoding='utf-8') as file:
+                        json.dump(focused, file, indent=2)
+                    print('Query selection comparison:', {
+                        name: focused[name] for name in (
+                            'AP', 'AP50', 'AP75', 'APs',
+                            'small_query_recall_iou75', 'small_best_query_rank')})
         
         return
