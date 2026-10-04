@@ -30,6 +30,11 @@ def _get_coco_ar75(coco_eval):
     return float(valid_recall.mean()) if valid_recall.size else float('nan')
 
 
+def _umqr_direct_alpha(model):
+    head = getattr(dist_utils.de_parallel(model).decoder, 'umqr_head', None)
+    return float(head.alpha.detach()) if head is not None and head.direct_box else None
+
+
 class DetSolver(BaseSolver):
     
     def fit(self, ):
@@ -142,6 +147,10 @@ class DetSolver(BaseSolver):
                 'epoch': epoch,
                 'n_parameters': n_parameters
             }
+            alpha = _umqr_direct_alpha(self.model)
+            if alpha is not None:
+                log_stats['umqr_alpha_model'] = alpha
+                log_stats['umqr_alpha_ema'] = _umqr_direct_alpha(self.ema.module) if self.ema else None
 
             if self.output_dir and dist_utils.is_main_process():
                 with (self.output_dir / "log.txt").open("a") as f:
@@ -161,6 +170,16 @@ class DetSolver(BaseSolver):
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print('Training time {}'.format(total_time_str))
+        if self.output_dir and dist_utils.is_main_process() and _umqr_direct_alpha(self.model) is not None:
+            alpha_report = {
+                'alpha_model': _umqr_direct_alpha(self.model),
+                'alpha_ema': _umqr_direct_alpha(self.ema.module) if self.ema else None,
+                'completed_epoch': self.last_epoch,
+                'source': 'end of training; last.pth, distinct from best.pth',
+            }
+            with (self.output_dir / 'umqr_direct_alpha_final.json').open('w', encoding='utf-8') as file:
+                json.dump(alpha_report, file, indent=2)
+            print('UMQR direct final alpha:', alpha_report)
 
 
     def val(self, ):
@@ -187,16 +206,27 @@ class DetSolver(BaseSolver):
                         'w', encoding='utf-8') as file:
                     json.dump(metrics, file, indent=2)
                 if self.cfg.yaml_cfg.get('umqr_evaluation_metrics', False):
-                    focused = {key: metrics[key] for key in ('AP', 'AP50', 'AP75', 'APs', 'AR100', 'AR75')}
+                    direct_alpha = _umqr_direct_alpha(module)
+                    names = ('AP', 'AP50', 'AP75', 'APs', 'AR100', 'AR75')
+                    if direct_alpha is not None:
+                        names = ('AP', 'AP50', 'AP75', 'APs', 'APm', 'AR100', 'AR75')
+                    focused = {key: metrics[key] for key in names}
                     focused.update(
                         config=self.cfg.yaml_cfg, checkpoint=self.cfg.resume,
                         weights='ema' if self.ema else 'model',
                         gpu_process_count=dist_utils.get_world_size(),
                         AR75_definition='COCO recall at IoU=0.75, area=all, maxDets=100; mean over valid categories')
-                    with (self.output_dir / 'umqr_metrics.json').open('w', encoding='utf-8') as file:
+                    filename = 'umqr_metrics.json'
+                    if direct_alpha is not None:
+                        filename = 'umqr_direct_metrics.json'
+                        focused.update(
+                            alpha=direct_alpha, alpha_model=_umqr_direct_alpha(self.model),
+                            alpha_ema=_umqr_direct_alpha(self.ema.module) if self.ema else None,
+                            alpha_definition='alpha of evaluated checkpoint weights; final-training alpha is recorded separately')
+                    with (self.output_dir / filename).open('w', encoding='utf-8') as file:
                         json.dump(focused, file, indent=2)
                     print('UMQR evaluation:', {key: focused[key] for key in (
-                        'AP', 'AP50', 'AP75', 'APs', 'AR100', 'AR75')})
+                        (*names, 'alpha') if direct_alpha is not None else names)})
                 if 'query_selection_metrics' in test_stats:
                     focused = {name: metrics[name] for name in ('AP', 'AP50', 'AP75', 'APs')}
                     focused.update(test_stats['query_selection_metrics'])

@@ -264,6 +264,7 @@ class TransformerDecoder(nn.Module):
         dec_out_quality_logits = []
         final_quality_probe_logits = None
         dec_out_keypoints, dec_out_log_scales = [], []
+        dec_geometry_boxes, dec_geometry_confidence = [], []
         ref_points_detach = F.sigmoid(ref_points_unact)
 
         output = target
@@ -280,12 +281,22 @@ class TransformerDecoder(nn.Module):
                     output.detach())
 
             bbox_features = output
+            geometry_residual = None
             if umqr_head is not None:
                 bbox_features, keypoints, log_scales = umqr_head(output, ref_points_detach)
+                if umqr_head.direct_box:
+                    geometry_residual, geometry_boxes, geometry_confidence = umqr_head.box_residual(
+                        keypoints, log_scales, ref_points_detach)
+                    if self.training or i == self.eval_idx:
+                        dec_geometry_boxes.append(geometry_boxes)
+                        dec_geometry_confidence.append(geometry_confidence)
                 if self.training or i == self.eval_idx:
                     dec_out_keypoints.append(keypoints)
                     dec_out_log_scales.append(log_scales)
-            inter_ref_bbox = F.sigmoid(bbox_head[i](bbox_features) + inverse_sigmoid(ref_points_detach))
+            delta_det = bbox_head[i](bbox_features)
+            if geometry_residual is not None:
+                delta_det = delta_det + geometry_residual
+            inter_ref_bbox = F.sigmoid(delta_det + inverse_sigmoid(ref_points_detach))
 
             if self.training:
                 dec_out_logits.append(score_head[i](output))
@@ -296,7 +307,10 @@ class TransformerDecoder(nn.Module):
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
                 else:
-                    dec_out_bboxes.append(F.sigmoid(bbox_head[i](bbox_features) + inverse_sigmoid(ref_points)))
+                    delta_det = bbox_head[i](bbox_features)
+                    if geometry_residual is not None:
+                        delta_det = delta_det + geometry_residual
+                    dec_out_bboxes.append(F.sigmoid(delta_det + inverse_sigmoid(ref_points)))
 
             elif i == self.eval_idx:
                 dec_out_logits.append(score_head[i](output))
@@ -317,6 +331,10 @@ class TransformerDecoder(nn.Module):
             'keypoints': torch.stack(dec_out_keypoints),
             'log_scales': torch.stack(dec_out_log_scales),
         } if dec_out_keypoints else None)
+        if dec_geometry_boxes:
+            umqr_outputs.update(
+                geometry_boxes=torch.stack(dec_geometry_boxes),
+                geometry_confidence=torch.stack(dec_geometry_confidence))
         outputs = (torch.stack(dec_out_bboxes), torch.stack(dec_out_logits),
                    quality_outputs, final_quality_probe_logits)
         # Preserve the existing decoder return contract when UMQR is disabled.
@@ -366,7 +384,8 @@ class RTDETRTransformerv2(nn.Module):
                  umqr=False,
                  umqr_hidden_dim=64,
                  umqr_log_scale_min=-5.0,
-                 umqr_log_scale_max=3.0):
+                 umqr_log_scale_max=3.0,
+                 umqr_refinement='hidden'):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -393,6 +412,8 @@ class RTDETRTransformerv2(nn.Module):
         self.quality_beta = quality_beta
         self.sar_quality = sar_quality
         self.umqr = umqr
+        if umqr_refinement not in ('hidden', 'direct') or (umqr_refinement == 'direct' and not umqr):
+            raise ValueError('umqr_refinement must be hidden/direct, with UMQR enabled for direct')
         if sar_quality and (query_select_method != 'quality' or quality_alpha != 1.0):
             raise ValueError('SQ-QS requires quality selection and quality_alpha=1')
         if sar_quality and (not math.isfinite(quality_beta) or quality_beta < 0):
@@ -511,7 +532,8 @@ class RTDETRTransformerv2(nn.Module):
             # Preserve all baseline parameter initialization and subsequent RNG.
             with torch.random.fork_rng(devices=[]):
                 self.umqr_head = UMQRHead(
-                    hidden_dim, umqr_hidden_dim, umqr_log_scale_min, umqr_log_scale_max)
+                    hidden_dim, umqr_hidden_dim, umqr_log_scale_min, umqr_log_scale_max,
+                    direct_box=umqr_refinement == 'direct')
         
     def _reset_parameters(self):
         bias = bias_init_with_prob(0.01)
@@ -819,6 +841,9 @@ class RTDETRTransformerv2(nn.Module):
         if umqr_outputs is not None:
             out['pred_keypoints'] = umqr_outputs['keypoints'][-1]
             out['pred_keypoint_log_scales'] = umqr_outputs['log_scales'][-1]
+            if 'geometry_boxes' in umqr_outputs:
+                out['pred_keypoint_boxes'] = umqr_outputs['geometry_boxes'][-1]
+                out['pred_geometry_confidence'] = umqr_outputs['geometry_confidence'][-1]
         if out_quality_logits is not None:
             out['pred_quality_logits'] = out_quality_logits[-1]
         if final_quality_probe_logits is not None:

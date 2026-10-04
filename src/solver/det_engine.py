@@ -25,6 +25,7 @@ from .query_stats import (
 )
 from .query_selection_metrics import QuerySelectionMetrics
 from ..zoo.rtdetr.umqr import box_keypoints
+from ..zoo.rtdetr.box_ops import box_cxcywh_to_xyxy
 
 
 def optimized_loss(loss_dict):
@@ -48,6 +49,32 @@ def check_umqr_first_batch(model, criterion, outputs, targets, loss_dict, global
                          if key.startswith('loss_ukp'))
     gt_valid = not gt.numel() or ((gt >= -1e-5) & (gt <= 1 + 1e-5)).all().item()
     shape_valid = points.shape == (*outputs['pred_boxes'].shape[:2], 5, 2) and scales.shape == points.shape
+    direct_details = {}
+    head = dist_utils.de_parallel(model).decoder.umqr_head
+    if head.direct_box:
+        boxes = outputs['pred_keypoint_boxes'].detach()
+        confidence = outputs['pred_geometry_confidence'].detach()
+        corners = box_cxcywh_to_xyxy(boxes)
+        geometry_valid = ((boxes >= 0) & (boxes <= 1)).all().item()
+        geometry_valid &= (boxes[..., 2:] > 0).all().item()
+        geometry_valid &= ((corners >= -1e-6) & (corners <= 1 + 1e-6)).all().item()
+        geometry_valid &= ((confidence > 0) & (confidence < 1)).all().item()
+        geometry_valid &= boxes.shape == outputs['pred_boxes'].shape
+        geometry_valid &= confidence.shape == (*points.shape[:2], 1)
+        if global_step == 0:
+            geometry_valid &= float(head.alpha.detach()) == 0.
+        values_finite &= all(torch.isfinite(tensor).all().item()
+                             for tensor in (boxes, confidence, head.alpha, outputs['pred_boxes']))
+        shape_valid &= geometry_valid
+        direct_details = {
+            'B_kp_legal': geometry_valid,
+            'B_kp_range': [float(boxes.min()), float(boxes.max())],
+            'width_height_range': [float(boxes[..., 2:].min()), float(boxes[..., 2:].max())],
+            'C_geo_range': [float(confidence.min()), float(confidence.max())],
+            'alpha': float(head.alpha.detach()),
+            'alpha_has_gradient': head.alpha.grad is not None,
+            'alpha_gradient': float(head.alpha.grad.detach()) if head.alpha.grad is not None else None,
+        }
     local_ok = bool(shape_valid and values_finite and gradients_finite and gt_valid)
     all_ok = torch.tensor(int(local_ok), device=points.device)
     if dist_utils.is_dist_available_and_initialized():
@@ -64,6 +91,7 @@ def check_umqr_first_batch(model, criterion, outputs, targets, loss_dict, global
             'parameters_with_gradient': f'{with_grad}/{len(parameters)}',
             'gradients_finite': gradients_finite, 'values_finite': values_finite,
             'all_ranks_passed': bool(all_ok.item()),
+            **direct_details,
         }, flush=True)
     if not all_ok.item():
         raise FloatingPointError('UMQR first-batch shape/GT/finite/gradient check failed on a rank')
