@@ -14,6 +14,7 @@ from typing import List
 
 from .denoising import get_contrastive_denoising_training_group
 from .sar_quality import SARQualityHead
+from .umqr import UMQRHead
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
 
@@ -256,11 +257,13 @@ class TransformerDecoder(nn.Module):
                 final_quality_probe_head,
                 query_pos_head,
                 attn_mask=None,
-                memory_mask=None):
+                memory_mask=None,
+                umqr_head=None):
         dec_out_bboxes = []
         dec_out_logits = []
         dec_out_quality_logits = []
         final_quality_probe_logits = None
+        dec_out_keypoints, dec_out_log_scales = [], []
         ref_points_detach = F.sigmoid(ref_points_unact)
 
         output = target
@@ -276,7 +279,13 @@ class TransformerDecoder(nn.Module):
                 final_quality_probe_logits = final_quality_probe_head(
                     output.detach())
 
-            inter_ref_bbox = F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach))
+            bbox_features = output
+            if umqr_head is not None:
+                bbox_features, keypoints, log_scales = umqr_head(output, ref_points_detach)
+                if self.training or i == self.eval_idx:
+                    dec_out_keypoints.append(keypoints)
+                    dec_out_log_scales.append(log_scales)
+            inter_ref_bbox = F.sigmoid(bbox_head[i](bbox_features) + inverse_sigmoid(ref_points_detach))
 
             if self.training:
                 dec_out_logits.append(score_head[i](output))
@@ -287,7 +296,7 @@ class TransformerDecoder(nn.Module):
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
                 else:
-                    dec_out_bboxes.append(F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points)))
+                    dec_out_bboxes.append(F.sigmoid(bbox_head[i](bbox_features) + inverse_sigmoid(ref_points)))
 
             elif i == self.eval_idx:
                 dec_out_logits.append(score_head[i](output))
@@ -304,13 +313,20 @@ class TransformerDecoder(nn.Module):
         quality_outputs = (
             torch.stack(dec_out_quality_logits)
             if dec_out_quality_logits else None)
-        return (torch.stack(dec_out_bboxes), torch.stack(dec_out_logits),
-                quality_outputs, final_quality_probe_logits)
+        umqr_outputs = ({
+            'keypoints': torch.stack(dec_out_keypoints),
+            'log_scales': torch.stack(dec_out_log_scales),
+        } if dec_out_keypoints else None)
+        outputs = (torch.stack(dec_out_bboxes), torch.stack(dec_out_logits),
+                   quality_outputs, final_quality_probe_logits)
+        # Preserve the existing decoder return contract when UMQR is disabled.
+        return (*outputs, umqr_outputs) if umqr_head is not None else outputs
 
 
 @register()
 class RTDETRTransformerv2(nn.Module):
-    __share__ = ['num_classes', 'eval_spatial_size']
+    __share__ = ['num_classes', 'eval_spatial_size',
+                 'umqr_log_scale_min', 'umqr_log_scale_max']
 
     def __init__(self,
                  num_classes=80,
@@ -346,7 +362,11 @@ class RTDETRTransformerv2(nn.Module):
                      0.50, 0.55, 0.60, 0.65, 0.70,
                      0.75, 0.80, 0.85, 0.90, 0.95),
                  sar_quality=False,
-                 sar_quality_pool_size=3):
+                 sar_quality_pool_size=3,
+                 umqr=False,
+                 umqr_hidden_dim=64,
+                 umqr_log_scale_min=-5.0,
+                 umqr_log_scale_max=3.0):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -372,6 +392,7 @@ class RTDETRTransformerv2(nn.Module):
         self.quality_alpha = quality_alpha
         self.quality_beta = quality_beta
         self.sar_quality = sar_quality
+        self.umqr = umqr
         if sar_quality and (query_select_method != 'quality' or quality_alpha != 1.0):
             raise ValueError('SQ-QS requires quality selection and quality_alpha=1')
         if sar_quality and (not math.isfinite(quality_beta) or quality_beta < 0):
@@ -399,6 +420,8 @@ class RTDETRTransformerv2(nn.Module):
                 'decoder quality modes are mutually exclusive')
         if sar_quality and quality_modes:
             raise ValueError('SQ-QS changes encoder quality only; disable decoder probes')
+        if umqr and (query_select_method != 'default' or sar_quality or quality_modes):
+            raise ValueError('E3 UMQR requires baseline query selection without quality branches')
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -484,6 +507,11 @@ class RTDETRTransformerv2(nn.Module):
             # initialized: identical seed preserves their E1 initialization.
             with torch.random.fork_rng(devices=[]):
                 self.enc_quality_head = SARQualityHead(hidden_dim, sar_quality_pool_size)
+        if umqr:
+            # Preserve all baseline parameter initialization and subsequent RNG.
+            with torch.random.fork_rng(devices=[]):
+                self.umqr_head = UMQRHead(
+                    hidden_dim, umqr_hidden_dim, umqr_log_scale_min, umqr_log_scale_max)
         
     def _reset_parameters(self):
         bias = bias_init_with_prob(0.01)
@@ -744,8 +772,7 @@ class RTDETRTransformerv2(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        (out_bboxes, out_logits, out_quality_logits,
-         final_quality_probe_logits) = self.decoder(
+        decoder_outputs = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -762,7 +789,15 @@ class RTDETRTransformerv2(nn.Module):
              if self.multi_threshold_class_conditioned_quality_probe
              else None),
             self.query_pos_head,
-            attn_mask=attn_mask)
+            attn_mask=attn_mask,
+            umqr_head=self.umqr_head if self.umqr else None)
+        if self.umqr:
+            (out_bboxes, out_logits, out_quality_logits,
+             final_quality_probe_logits, umqr_outputs) = decoder_outputs
+        else:
+            (out_bboxes, out_logits, out_quality_logits,
+             final_quality_probe_logits) = decoder_outputs
+            umqr_outputs = None
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
@@ -774,8 +809,16 @@ class RTDETRTransformerv2(nn.Module):
                 _, final_quality_probe_logits = torch.split(
                     final_quality_probe_logits,
                     dn_meta['dn_num_split'], dim=1)
+            if umqr_outputs is not None:
+                # DN sampling and detection losses are unchanged; UMQR loss
+                # supervises only regular queries matched by the existing matcher.
+                umqr_outputs = {key: torch.split(value, dn_meta['dn_num_split'], dim=2)[1]
+                                for key, value in umqr_outputs.items()}
 
         out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+        if umqr_outputs is not None:
+            out['pred_keypoints'] = umqr_outputs['keypoints'][-1]
+            out['pred_keypoint_log_scales'] = umqr_outputs['log_scales'][-1]
         if out_quality_logits is not None:
             out['pred_quality_logits'] = out_quality_logits[-1]
         if final_quality_probe_logits is not None:
@@ -795,7 +838,9 @@ class RTDETRTransformerv2(nn.Module):
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(
                 out_logits[:-1], out_bboxes[:-1],
-                out_quality_logits[:-1] if out_quality_logits is not None else None)
+                out_quality_logits[:-1] if out_quality_logits is not None else None,
+                umqr_outputs['keypoints'][:-1] if umqr_outputs is not None else None,
+                umqr_outputs['log_scales'][:-1] if umqr_outputs is not None else None)
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
 
@@ -808,15 +853,19 @@ class RTDETRTransformerv2(nn.Module):
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord,
-                      outputs_quality=None):
+                      outputs_quality=None, outputs_keypoints=None,
+                      outputs_log_scales=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         if outputs_quality is None:
-            return [{'pred_logits': a, 'pred_boxes': b}
-                    for a, b in zip(outputs_class, outputs_coord)]
-        return [
-            {'pred_logits': a, 'pred_boxes': b, 'pred_quality_logits': q}
-            for a, b, q in zip(
-                outputs_class, outputs_coord, outputs_quality)
-        ]
+            outputs = [{'pred_logits': a, 'pred_boxes': b}
+                       for a, b in zip(outputs_class, outputs_coord)]
+        else:
+            outputs = [
+                {'pred_logits': a, 'pred_boxes': b, 'pred_quality_logits': q}
+                for a, b, q in zip(outputs_class, outputs_coord, outputs_quality)]
+        if outputs_keypoints is not None:
+            for output, points, scales in zip(outputs, outputs_keypoints, outputs_log_scales):
+                output.update(pred_keypoints=points, pred_keypoint_log_scales=scales)
+        return outputs

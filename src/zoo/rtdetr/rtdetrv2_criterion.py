@@ -18,6 +18,7 @@ from .box_ops import (
 )
 from ...misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from ...core import register
+from .umqr import box_keypoints, uncertainty_keypoint_loss, validate_log_scale_bounds
 
 
 @register()
@@ -27,7 +28,7 @@ class RTDETRCriterionv2(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    __share__ = ['num_classes', ]
+    __share__ = ['num_classes', 'umqr_log_scale_min', 'umqr_log_scale_max']
     __inject__ = ['matcher', ]
 
     def __init__(self, \
@@ -56,7 +57,10 @@ class RTDETRCriterionv2(nn.Module):
         relative_small_loss=False,
         relative_small_reference_size=640.0,
         relative_small_threshold_px=32.0,
-        relative_small_min_scale_px=4.0):
+        relative_small_min_scale_px=4.0,
+        umqr=False,
+        umqr_log_scale_min=-5.0,
+        umqr_log_scale_max=3.0):
         """Create the criterion.
         Parameters:
             matcher: module able to compute a matching between targets and proposals
@@ -75,6 +79,16 @@ class RTDETRCriterionv2(nn.Module):
         self.share_matched_indices = share_matched_indices
         self.alpha = alpha
         self.gamma = gamma
+        self.umqr = umqr
+        self.umqr_log_scale_min = umqr_log_scale_min
+        self.umqr_log_scale_max = umqr_log_scale_max
+        if umqr:
+            validate_log_scale_bounds(umqr_log_scale_min, umqr_log_scale_max)
+            if weight_dict.get('loss_ukp') != 1.0:
+                raise ValueError('E3 fixes lambda_kp=1.0 (weight_dict.loss_ukp)')
+            if (relative_small_loss or final_quality_probe or class_conditioned_final_quality_probe
+                    or multi_threshold_class_conditioned_quality_probe):
+                raise ValueError('E3 UMQR must use the baseline detection criterion')
         if quality_loss_topk <= 0:
             raise ValueError('quality_loss_topk must be positive')
         self.quality_loss_topk = quality_loss_topk
@@ -547,6 +561,19 @@ class RTDETRCriterionv2(nn.Module):
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
+    def loss_umqr(self, outputs, targets, indices, num_boxes):
+        """Foreground only; reuse the current detection-layer matching."""
+        points = outputs['pred_keypoints']
+        scales = outputs['pred_keypoint_log_scales']
+        if points.shape != (*outputs['pred_boxes'].shape[:2], 5, 2) or scales.shape != points.shape:
+            raise ValueError('UMQR predictions must both have shape [B, Q, 5, 2]')
+        idx = self._get_src_permutation_idx(indices)
+        boxes = torch.cat([target['boxes'][j] for target, (_, j) in zip(targets, indices)])
+        target_points = box_keypoints(boxes.float())
+        return {'loss_ukp': uncertainty_keypoint_loss(
+            points[idx], scales[idx], target_points, num_boxes,
+            self.umqr_log_scale_min, self.umqr_log_scale_max)}
+
     def _get_tgt_permutation_idx(self, indices):
         # permute targets following indices
         batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
@@ -617,6 +644,9 @@ class RTDETRCriterionv2(nn.Module):
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
 
+        if self.umqr:
+            losses['loss_ukp'] = self.loss_umqr(outputs, targets, indices, num_boxes)['loss_ukp']
+
         if (self.relative_small_loss
                 and 'loss_rel_small' in self.weight_dict):
             relative_losses = self.loss_relative_small_boxes(
@@ -658,6 +688,9 @@ class RTDETRCriterionv2(nn.Module):
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f'_aux_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+                if self.umqr:
+                    losses[f'loss_ukp_aux_{i}'] = self.loss_umqr(
+                        aux_outputs, targets, indices, num_boxes)['loss_ukp']
                 if (self.relative_small_loss
                         and 'loss_rel_small' in self.weight_dict):
                     relative_losses = self.loss_relative_small_boxes(

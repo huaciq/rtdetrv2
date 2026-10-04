@@ -24,11 +24,50 @@ from .query_stats import (
     QueryStats,
 )
 from .query_selection_metrics import QuerySelectionMetrics
+from ..zoo.rtdetr.umqr import box_keypoints
 
 
 def optimized_loss(loss_dict):
     """Exclude detached metric-only entries from the optimized objective."""
     return sum(value for key, value in loss_dict.items() if not key.endswith('_raw'))
+
+
+def check_umqr_first_batch(model, criterion, outputs, targets, loss_dict, global_step):
+    """One correctness report after backward, before gradients are cleared."""
+    if not getattr(criterion, 'umqr', False) or getattr(criterion, '_umqr_debug_done', False):
+        return
+    points = outputs['pred_keypoints'].detach()
+    scales = outputs['pred_keypoint_log_scales'].detach()
+    gt = box_keypoints(torch.cat([target['boxes'].float() for target in targets]))
+    parameters = list(dist_utils.de_parallel(model).decoder.umqr_head.named_parameters())
+    with_grad = sum(parameter.grad is not None for _, parameter in parameters)
+    gradients_finite = all(parameter.grad is not None and torch.isfinite(parameter.grad).all().item()
+                           for _, parameter in parameters)
+    values_finite = all(torch.isfinite(tensor).all().item() for tensor in (points, scales, gt))
+    values_finite &= all(torch.isfinite(value).all().item() for key, value in loss_dict.items()
+                         if key.startswith('loss_ukp'))
+    gt_valid = not gt.numel() or ((gt >= -1e-5) & (gt <= 1 + 1e-5)).all().item()
+    shape_valid = points.shape == (*outputs['pred_boxes'].shape[:2], 5, 2) and scales.shape == points.shape
+    local_ok = bool(shape_valid and values_finite and gradients_finite and gt_valid)
+    all_ok = torch.tensor(int(local_ok), device=points.device)
+    if dist_utils.is_dist_available_and_initialized():
+        torch.distributed.all_reduce(all_ok, op=torch.distributed.ReduceOp.MIN)
+    if dist_utils.is_main_process():
+        print('UMQR_FIRST_BATCH', {
+            'global_step': global_step, 'keypoints_shape': list(points.shape),
+            'GT_keypoint_range': [float(gt.min()), float(gt.max())] if gt.numel() else None,
+            'log_scale_range': [float(scales.min()), float(scales.max())],
+            'sigma_range': [float(scales.min().exp()), float(scales.max().exp())],
+            'L_ukp': float(loss_dict['loss_ukp'].detach()),
+            'aux_L_ukp': {key: float(value.detach()) for key, value in loss_dict.items()
+                          if key.startswith('loss_ukp_aux_')},
+            'parameters_with_gradient': f'{with_grad}/{len(parameters)}',
+            'gradients_finite': gradients_finite, 'values_finite': values_finite,
+            'all_ranks_passed': bool(all_ok.item()),
+        }, flush=True)
+    if not all_ok.item():
+        raise FloatingPointError('UMQR first-batch shape/GT/finite/gradient check failed on a rank')
+    criterion._umqr_debug_done = True
 
 
 def _mean_rank_gradient_norm(loss, parameters):
@@ -106,6 +145,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 model, criterion, loss_dict, global_step
             )
             scaler.scale(loss).backward()
+            check_umqr_first_batch(model, criterion, outputs, targets, loss_dict, global_step)
             
             if max_norm > 0:
                 scaler.unscale_(optimizer)
@@ -125,6 +165,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             )
             optimizer.zero_grad()
             loss.backward()
+            check_umqr_first_batch(model, criterion, outputs, targets, loss_dict, global_step)
             
             if max_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)

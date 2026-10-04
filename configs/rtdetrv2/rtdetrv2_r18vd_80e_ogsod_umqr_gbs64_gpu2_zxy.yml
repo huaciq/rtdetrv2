@@ -1,0 +1,16 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_baseline_gbs64_gpu2_zxy.yml'
+
+# E3 = E0 + decoder UMQR only. All training/data/query settings inherit E0.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_80e_umqr
+umqr_evaluation_metrics: True
+umqr_log_scale_min: -5.0
+umqr_log_scale_max: 3.0
+
+RTDETRTransformerv2:
+  umqr: True
+  umqr_hidden_dim: 64
+
+RTDETRCriterionv2:
+  umqr: True
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_ukp: 1.0}

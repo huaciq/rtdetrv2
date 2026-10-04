@@ -186,6 +186,17 @@ class DetSolver(BaseSolver):
                 with (self.output_dir / 'evaluation_metrics.json').open(
                         'w', encoding='utf-8') as file:
                     json.dump(metrics, file, indent=2)
+                if self.cfg.yaml_cfg.get('umqr_evaluation_metrics', False):
+                    focused = {key: metrics[key] for key in ('AP', 'AP50', 'AP75', 'APs', 'AR100', 'AR75')}
+                    focused.update(
+                        config=self.cfg.yaml_cfg, checkpoint=self.cfg.resume,
+                        weights='ema' if self.ema else 'model',
+                        gpu_process_count=dist_utils.get_world_size(),
+                        AR75_definition='COCO recall at IoU=0.75, area=all, maxDets=100; mean over valid categories')
+                    with (self.output_dir / 'umqr_metrics.json').open('w', encoding='utf-8') as file:
+                        json.dump(focused, file, indent=2)
+                    print('UMQR evaluation:', {key: focused[key] for key in (
+                        'AP', 'AP50', 'AP75', 'APs', 'AR100', 'AR75')})
                 if 'query_selection_metrics' in test_stats:
                     focused = {name: metrics[name] for name in ('AP', 'AP50', 'AP75', 'APs')}
                     focused.update(test_stats['query_selection_metrics'])
