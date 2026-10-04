@@ -1,0 +1,11 @@
+__include__:
+  - './rtdetrv2_r18vd_80e_ogsod_baseline_gbs64_gpu2_zxy.yml'
+
+# E4 = E0 + boundary appearance residual; no QAQS/SQ-QS/UMQR.
+output_dir: /home/zxy/sar/experiments/ogsod_rtdetrv2_r18_80e_sber
+sber_evaluation_metrics: True
+
+RTDETRTransformerv2:
+  sber: True
+  sber_hidden_dim: 64
+  sber_rho: 0.1

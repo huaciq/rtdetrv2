@@ -15,6 +15,7 @@ from typing import List
 from .denoising import get_contrastive_denoising_training_group
 from .sar_quality import SARQualityHead
 from .umqr import UMQRHead
+from .sber import SBERHead, encoder_feature_maps, apply_boundary_residual
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
 
@@ -258,7 +259,8 @@ class TransformerDecoder(nn.Module):
                 query_pos_head,
                 attn_mask=None,
                 memory_mask=None,
-                umqr_head=None):
+                umqr_head=None,
+                sber_head=None):
         dec_out_bboxes = []
         dec_out_logits = []
         dec_out_quality_logits = []
@@ -266,6 +268,10 @@ class TransformerDecoder(nn.Module):
         dec_out_keypoints, dec_out_log_scales = [], []
         dec_geometry_boxes, dec_geometry_confidence = [], []
         ref_points_detach = F.sigmoid(ref_points_unact)
+        boundary_maps = encoder_feature_maps(memory, memory_spatial_shapes) if sber_head is not None else None
+        collect_sber_debug = (sber_head is not None and self.training
+                              and not getattr(sber_head, '_debug_done', False))
+        sber_debug = []
 
         output = target
         for i, layer in enumerate(self.layers):
@@ -297,6 +303,18 @@ class TransformerDecoder(nn.Module):
             if geometry_residual is not None:
                 delta_det = delta_det + geometry_residual
             inter_ref_bbox = F.sigmoid(delta_det + inverse_sigmoid(ref_points_detach))
+            boundary_fractions = None
+            if sber_head is not None:
+                boundary_fractions, details = sber_head(
+                    boundary_maps, ref_points_detach, collect_debug=collect_sber_debug)
+                box_det = inter_ref_bbox
+                inter_ref_bbox = apply_boundary_residual(box_det, boundary_fractions)
+                if collect_sber_debug:
+                    details.update(
+                        layer=i,
+                        boundary_residual_abs_mean=(inter_ref_bbox.detach() - box_det.detach()).abs().mean(),
+                        boundary_residual_abs_max=(inter_ref_bbox.detach() - box_det.detach()).abs().max())
+                    sber_debug.append(details)
 
             if self.training:
                 dec_out_logits.append(score_head[i](output))
@@ -310,7 +328,10 @@ class TransformerDecoder(nn.Module):
                     delta_det = bbox_head[i](bbox_features)
                     if geometry_residual is not None:
                         delta_det = delta_det + geometry_residual
-                    dec_out_bboxes.append(F.sigmoid(delta_det + inverse_sigmoid(ref_points)))
+                    supervised_box = F.sigmoid(delta_det + inverse_sigmoid(ref_points))
+                    if boundary_fractions is not None:
+                        supervised_box = apply_boundary_residual(supervised_box, boundary_fractions)
+                    dec_out_bboxes.append(supervised_box)
 
             elif i == self.eval_idx:
                 dec_out_logits.append(score_head[i](output))
@@ -338,6 +359,8 @@ class TransformerDecoder(nn.Module):
         outputs = (torch.stack(dec_out_bboxes), torch.stack(dec_out_logits),
                    quality_outputs, final_quality_probe_logits)
         # Preserve the existing decoder return contract when UMQR is disabled.
+        if sber_head is not None:
+            return (*outputs, sber_debug)
         return (*outputs, umqr_outputs) if umqr_head is not None else outputs
 
 
@@ -385,7 +408,10 @@ class RTDETRTransformerv2(nn.Module):
                  umqr_hidden_dim=64,
                  umqr_log_scale_min=-5.0,
                  umqr_log_scale_max=3.0,
-                 umqr_refinement='hidden'):
+                 umqr_refinement='hidden',
+                 sber=False,
+                 sber_hidden_dim=64,
+                 sber_rho=0.1):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -412,6 +438,7 @@ class RTDETRTransformerv2(nn.Module):
         self.quality_beta = quality_beta
         self.sar_quality = sar_quality
         self.umqr = umqr
+        self.sber = sber
         if umqr_refinement not in ('hidden', 'direct') or (umqr_refinement == 'direct' and not umqr):
             raise ValueError('umqr_refinement must be hidden/direct, with UMQR enabled for direct')
         if sar_quality and (query_select_method != 'quality' or quality_alpha != 1.0):
@@ -443,6 +470,8 @@ class RTDETRTransformerv2(nn.Module):
             raise ValueError('SQ-QS changes encoder quality only; disable decoder probes')
         if umqr and (query_select_method != 'default' or sar_quality or quality_modes):
             raise ValueError('E3 UMQR requires baseline query selection without quality branches')
+        if sber and (query_select_method != 'default' or sar_quality or quality_modes or umqr):
+            raise ValueError('E4 SBER requires baseline without QAQS/SQ-QS/UMQR or quality probes')
 
         # backbone feature projection
         self._build_input_proj_layer(feat_channels)
@@ -534,6 +563,9 @@ class RTDETRTransformerv2(nn.Module):
                 self.umqr_head = UMQRHead(
                     hidden_dim, umqr_hidden_dim, umqr_log_scale_min, umqr_log_scale_max,
                     direct_box=umqr_refinement == 'direct')
+        if sber:
+            with torch.random.fork_rng(devices=[]):
+                self.sber_head = SBERHead(hidden_dim, sber_hidden_dim, sber_rho)
         
     def _reset_parameters(self):
         bias = bias_init_with_prob(0.01)
@@ -812,10 +844,15 @@ class RTDETRTransformerv2(nn.Module):
              else None),
             self.query_pos_head,
             attn_mask=attn_mask,
-            umqr_head=self.umqr_head if self.umqr else None)
+            umqr_head=self.umqr_head if self.umqr else None,
+            sber_head=self.sber_head if self.sber else None)
         if self.umqr:
             (out_bboxes, out_logits, out_quality_logits,
              final_quality_probe_logits, umqr_outputs) = decoder_outputs
+        elif self.sber:
+            (out_bboxes, out_logits, out_quality_logits,
+             final_quality_probe_logits, sber_debug) = decoder_outputs
+            umqr_outputs = None
         else:
             (out_bboxes, out_logits, out_quality_logits,
              final_quality_probe_logits) = decoder_outputs
@@ -838,6 +875,8 @@ class RTDETRTransformerv2(nn.Module):
                                 for key, value in umqr_outputs.items()}
 
         out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+        if self.sber and sber_debug:
+            out['sber_debug'] = sber_debug
         if umqr_outputs is not None:
             out['pred_keypoints'] = umqr_outputs['keypoints'][-1]
             out['pred_keypoint_log_scales'] = umqr_outputs['log_scales'][-1]

@@ -205,6 +205,17 @@ class DetSolver(BaseSolver):
                 with (self.output_dir / 'evaluation_metrics.json').open(
                         'w', encoding='utf-8') as file:
                     json.dump(metrics, file, indent=2)
+                if self.cfg.yaml_cfg.get('sber_evaluation_metrics', False):
+                    names = ('AP', 'AP50', 'AP75', 'APs', 'APm', 'APl', 'AR100', 'AR75')
+                    focused = {name: metrics[name] for name in names}
+                    focused.update(
+                        config=self.cfg.yaml_cfg, checkpoint=self.cfg.resume,
+                        weights='ema' if self.ema else 'model',
+                        gpu_process_count=dist_utils.get_world_size(),
+                        AR75_definition='COCO recall at IoU=0.75, area=all, maxDets=100; mean over valid categories')
+                    with (self.output_dir / 'sber_metrics.json').open('w', encoding='utf-8') as file:
+                        json.dump(focused, file, indent=2)
+                    print('SBER evaluation:', {name: focused[name] for name in names})
                 if self.cfg.yaml_cfg.get('umqr_evaluation_metrics', False):
                     direct_alpha = _umqr_direct_alpha(module)
                     names = ('AP', 'AP50', 'AP75', 'APs', 'AR100', 'AR75')

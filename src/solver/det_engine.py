@@ -117,6 +117,62 @@ def _mean_rank_gradient_norm(loss, parameters):
     return norm
 
 
+def check_sber_first_batch(model, outputs, loss_dict, global_step):
+    """One all-rank correctness check after ordinary detection backward."""
+    decoder = dist_utils.de_parallel(model).decoder
+    if not getattr(decoder, 'sber', False):
+        return
+    head = decoder.sber_head
+    if getattr(head, '_debug_done', False):
+        return
+    details = outputs.get('sber_debug', [])
+    boxes = outputs['pred_boxes'].detach()
+    corners = box_cxcywh_to_xyxy(boxes)
+    box_tensors = [boxes]
+    for key in ('aux_outputs', 'dn_aux_outputs'):
+        box_tensors.extend(output['pred_boxes'].detach() for output in outputs.get(key, []))
+    boxes_legal = all(
+        ((box >= 0) & (box <= 1)).all().item() and (box[..., 2:] > 0).all().item()
+        and ((box_cxcywh_to_xyxy(box) >= -1e-6)
+             & (box_cxcywh_to_xyxy(box) <= 1 + 1e-6)).all().item()
+        for box in box_tensors)
+    parameters = list(head.named_parameters())
+    gradients_finite = all(parameter.grad is not None and torch.isfinite(parameter.grad).all().item()
+                           for _, parameter in parameters)
+    values_finite = all(torch.isfinite(value).all().item()
+                        for value in (*box_tensors, *loss_dict.values()))
+    detail_valid = bool(details)
+    reports = []
+    for detail in details:
+        values_finite &= all(torch.isfinite(value).all().item() for value in detail.values()
+                             if isinstance(value, torch.Tensor))
+        detail_valid &= bool(detail['evidence_finite'].item())
+        detail_valid &= 0 <= float(detail['sampling_min']) <= float(detail['sampling_max']) <= 1
+        detail_valid &= 0 < float(detail['gate_min']) <= float(detail['gate_max']) < 1
+        detail_valid &= float(detail['offset_fraction_abs_max']) <= head.rho + 1e-6
+        reports.append({key: value.detach().tolist() if isinstance(value, torch.Tensor) else value
+                        for key, value in detail.items()})
+    all_ok = torch.tensor(int(boxes_legal and gradients_finite and values_finite and detail_valid),
+                          device=boxes.device)
+    if dist_utils.is_dist_available_and_initialized():
+        torch.distributed.all_reduce(all_ok, op=torch.distributed.ReduceOp.MIN)
+    if dist_utils.is_main_process():
+        print('SBER_FIRST_BATCH', {
+            'global_step': global_step, 'layers': reports,
+            'parameters_with_gradient': f'{sum(p.grad is not None for _, p in parameters)}/{len(parameters)}',
+            'gradient_abs_max': {name: float(parameter.grad.detach().abs().max())
+                                 if parameter.grad is not None else None for name, parameter in parameters},
+            'refined_boxes_legal': boxes_legal,
+            'box_range': [float(boxes.min()), float(boxes.max())],
+            'corner_range': [float(corners.min()), float(corners.max())],
+            'gradients_finite': gradients_finite, 'values_finite': values_finite,
+            'all_ranks_passed': bool(all_ok.item()),
+        }, flush=True)
+    if not all_ok.item():
+        raise FloatingPointError('SBER first-batch sampling/box/gradient/finite check failed on a rank')
+    head._debug_done = True
+
+
 def measure_gkd_gradient_norms(model, criterion, loss_dict, global_step):
     """Measure detection and weighted-GKD gradient norms at sampled steps."""
     interval = int(getattr(criterion, 'grad_norm_interval', 0))
@@ -174,6 +230,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             )
             scaler.scale(loss).backward()
             check_umqr_first_batch(model, criterion, outputs, targets, loss_dict, global_step)
+            check_sber_first_batch(model, outputs, loss_dict, global_step)
             
             if max_norm > 0:
                 scaler.unscale_(optimizer)
@@ -194,6 +251,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             optimizer.zero_grad()
             loss.backward()
             check_umqr_first_batch(model, criterion, outputs, targets, loss_dict, global_step)
+            check_sber_first_batch(model, outputs, loss_dict, global_step)
             
             if max_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
