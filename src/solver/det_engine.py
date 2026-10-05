@@ -131,10 +131,11 @@ def check_sber_first_batch(model, outputs, loss_dict, global_step):
     box_tensors = [boxes]
     for key in ('aux_outputs', 'dn_aux_outputs'):
         box_tensors.extend(output['pred_boxes'].detach() for output in outputs.get(key, []))
+    scale_aware = getattr(decoder, 'sber_scale_aware', False)
     boxes_legal = all(
         ((box >= 0) & (box <= 1)).all().item() and (box[..., 2:] > 0).all().item()
-        and ((box_cxcywh_to_xyxy(box) >= -1e-6)
-             & (box_cxcywh_to_xyxy(box) <= 1 + 1e-6)).all().item()
+        and (scale_aware or ((box_cxcywh_to_xyxy(box) >= -1e-6)
+                            & (box_cxcywh_to_xyxy(box) <= 1 + 1e-6)).all().item())
         for box in box_tensors)
     parameters = list(head.named_parameters())
     gradients_finite = all(parameter.grad is not None and torch.isfinite(parameter.grad).all().item()
@@ -150,6 +151,18 @@ def check_sber_first_batch(model, outputs, loss_dict, global_step):
         detail_valid &= 0 <= float(detail['sampling_min']) <= float(detail['sampling_max']) <= 1
         detail_valid &= 0 < float(detail['gate_min']) <= float(detail['gate_max']) < 1
         detail_valid &= float(detail['offset_fraction_abs_max']) <= head.rho + 1e-6
+        if scale_aware:
+            # Baseline cxcywh is normalized, but its image corners may extend
+            # outside [0,1]. Only enabled boxes undergo E4's legal projection.
+            detail_valid &= bool(detail['enabled_box_corners_legal'].item())
+            detail_valid &= detail['large_boundary_residual_abs_max'].item() == 0.
+            detail_valid &= detail['large_offset_fraction_abs_max'].item() == 0.
+            detail_valid &= detail['large_bbox_exact_baseline']
+            detail_valid &= detail['small_medium_fraction_exact_e4']
+            for group in ('small', 'medium', 'large'):
+                rate = detail[f'{group}_sber_enabled_ratio']
+                if rate is not None:
+                    detail_valid &= float(rate) == (0. if group == 'large' else 1.)
         reports.append({key: value.detach().tolist() if isinstance(value, torch.Tensor) else value
                         for key, value in detail.items()})
     all_ok = torch.tensor(int(boxes_legal and gradients_finite and values_finite and detail_valid),

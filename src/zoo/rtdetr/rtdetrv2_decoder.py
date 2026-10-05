@@ -15,7 +15,8 @@ from typing import List
 from .denoising import get_contrastive_denoising_training_group
 from .sar_quality import SARQualityHead
 from .umqr import UMQRHead
-from .sber import SBERHead, encoder_feature_maps, apply_boundary_residual
+from .sber import (SBERHead, encoder_feature_maps, apply_boundary_residual,
+                   sber_scale_mask, sber_scale_debug)
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
 
@@ -260,7 +261,9 @@ class TransformerDecoder(nn.Module):
                 attn_mask=None,
                 memory_mask=None,
                 umqr_head=None,
-                sber_head=None):
+                sber_head=None,
+                sber_scale_aware=False,
+                sber_regular_queries=None):
         dec_out_bboxes = []
         dec_out_logits = []
         dec_out_quality_logits = []
@@ -304,16 +307,25 @@ class TransformerDecoder(nn.Module):
                 delta_det = delta_det + geometry_residual
             inter_ref_bbox = F.sigmoid(delta_det + inverse_sigmoid(ref_points_detach))
             boundary_fractions = None
+            use_sber = None
             if sber_head is not None:
                 boundary_fractions, details = sber_head(
                     boundary_maps, ref_points_detach, collect_debug=collect_sber_debug)
+                if sber_scale_aware:
+                    use_sber = sber_scale_mask(ref_points_detach)
+                    raw_fractions = boundary_fractions
+                    boundary_fractions = boundary_fractions * use_sber
                 box_det = inter_ref_bbox
-                inter_ref_bbox = apply_boundary_residual(box_det, boundary_fractions)
+                inter_ref_bbox = apply_boundary_residual(box_det, boundary_fractions, use_sber=use_sber)
                 if collect_sber_debug:
                     details.update(
                         layer=i,
                         boundary_residual_abs_mean=(inter_ref_bbox.detach() - box_det.detach()).abs().mean(),
                         boundary_residual_abs_max=(inter_ref_bbox.detach() - box_det.detach()).abs().max())
+                    if sber_scale_aware:
+                        details.update(sber_scale_debug(
+                            ref_points_detach, use_sber, raw_fractions, boundary_fractions,
+                            box_det, inter_ref_bbox, sber_regular_queries or target.shape[1]))
                     sber_debug.append(details)
 
             if self.training:
@@ -330,7 +342,7 @@ class TransformerDecoder(nn.Module):
                         delta_det = delta_det + geometry_residual
                     supervised_box = F.sigmoid(delta_det + inverse_sigmoid(ref_points))
                     if boundary_fractions is not None:
-                        supervised_box = apply_boundary_residual(supervised_box, boundary_fractions)
+                        supervised_box = apply_boundary_residual(supervised_box, boundary_fractions, use_sber=use_sber)
                     dec_out_bboxes.append(supervised_box)
 
             elif i == self.eval_idx:
@@ -411,7 +423,8 @@ class RTDETRTransformerv2(nn.Module):
                  umqr_refinement='hidden',
                  sber=False,
                  sber_hidden_dim=64,
-                 sber_rho=0.1):
+                 sber_rho=0.1,
+                 sber_scale_aware=False):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -439,6 +452,9 @@ class RTDETRTransformerv2(nn.Module):
         self.sar_quality = sar_quality
         self.umqr = umqr
         self.sber = sber
+        self.sber_scale_aware = sber_scale_aware
+        if sber_scale_aware and not sber:
+            raise ValueError('E4-prime scale-aware bypass requires SBER enabled')
         if umqr_refinement not in ('hidden', 'direct') or (umqr_refinement == 'direct' and not umqr):
             raise ValueError('umqr_refinement must be hidden/direct, with UMQR enabled for direct')
         if sar_quality and (query_select_method != 'quality' or quality_alpha != 1.0):
@@ -845,7 +861,9 @@ class RTDETRTransformerv2(nn.Module):
             self.query_pos_head,
             attn_mask=attn_mask,
             umqr_head=self.umqr_head if self.umqr else None,
-            sber_head=self.sber_head if self.sber else None)
+            sber_head=self.sber_head if self.sber else None,
+            sber_scale_aware=self.sber_scale_aware,
+            sber_regular_queries=self.num_queries)
         if self.umqr:
             (out_bboxes, out_logits, out_quality_logits,
              final_quality_probe_logits, umqr_outputs) = decoder_outputs

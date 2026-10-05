@@ -9,6 +9,15 @@ from torch.nn import functional as F
 from .box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 
 
+SBER_AREA_THRESHOLD = 0.0225  # Fixed E4' boundary; no threshold sweep.
+
+
+def sber_scale_mask(reference_boxes):
+    """Decide from the current detached reference, never box_det or GT."""
+    size = reference_boxes.detach().float()[..., 2:]
+    return (size.prod(-1, keepdim=True) <= SBER_AREA_THRESHOLD)
+
+
 def encoder_feature_maps(memory, spatial_shapes):
     """Views of the unchanged projected HybridEncoder P3/P4/P5 memory."""
     sizes = [height * width for height, width in spatial_shapes]
@@ -61,7 +70,7 @@ def sample_boundary_features(feature_maps, coordinates, weights):
     return mixed
 
 
-def apply_boundary_residual(box_det, fractions, eps=1e-6):
+def apply_boundary_residual(box_det, fractions, eps=1e-6, use_sber=None):
     """Bounded edge shifts of the original bbox result, then valid cxcywh.
 
     Fractions are [dl,dr,dt,db], measured in box_det width/height. They are
@@ -76,7 +85,44 @@ def apply_boundary_residual(box_det, fractions, eps=1e-6):
     lower = corners[..., :2].clamp(0., 1. - eps)
     upper = torch.maximum(corners[..., 2:].clamp(eps, 1.), lower + eps)
     refined = box_xyxy_to_cxcywh(torch.cat((lower, upper), -1))
+    if use_sber is not None:
+        # A zero edge shift still undergoes E4's clipping/roundtrip. Selecting
+        # the original box is necessary for an exact large-query bypass.
+        refined = torch.where(use_sber, refined, box_det)
     return refined
+
+
+def sber_scale_debug(reference_boxes, use_sber, raw_fractions, masked_fractions,
+                     box_det, refined, regular_queries):
+    """Small detached summaries; proportions exclude DN, bypass checks include it."""
+    area = reference_boxes.detach().float()[..., 2:].prod(-1)
+    regular_area = area[:, -regular_queries:]
+    regular_mask = use_sber.squeeze(-1)[:, -regular_queries:]
+    groups = {'small': regular_area <= .0025,
+              'medium': (regular_area > .0025) & (regular_area <= SBER_AREA_THRESHOLD),
+              'large': regular_area > SBER_AREA_THRESHOLD}
+    stats = {'area_threshold': SBER_AREA_THRESHOLD, 'query_scope': 'regular; normalized reference area',
+             'regular_query_count': regular_area.numel(),
+             'sber_enabled_query_ratio': regular_mask.float().mean()}
+    for name, group in groups.items():
+        count = group.sum()
+        stats[f'{name}_query_count'] = count
+        stats[f'{name}_query_ratio'] = group.float().mean()
+        # Empty groups report None rather than an undefined/NaN rate.
+        stats[f'{name}_sber_enabled_ratio'] = ((regular_mask & group).sum().float() / count
+                                               if count.item() else None)
+    enabled = use_sber.squeeze(-1)
+    large = ~enabled
+    difference = (refined.detach() - box_det.detach()).abs()
+    stats['large_boundary_residual_abs_max'] = difference[large].max() if large.any() else difference.new_zeros(())
+    stats['large_offset_fraction_abs_max'] = (masked_fractions.detach()[large].abs().max()
+                                              if large.any() else difference.new_zeros(()))
+    stats['large_bbox_exact_baseline'] = torch.equal(refined.detach()[large], box_det.detach()[large])
+    stats['small_medium_fraction_exact_e4'] = torch.equal(
+        masked_fractions.detach()[enabled], raw_fractions.detach()[enabled])
+    corners = box_cxcywh_to_xyxy(refined.detach()[enabled])
+    stats['enabled_box_corners_legal'] = ((corners >= -1e-6) & (corners <= 1 + 1e-6)).all()
+    return stats
 
 
 class SBERHead(nn.Module):

@@ -207,13 +207,19 @@ class DetSolver(BaseSolver):
                     json.dump(metrics, file, indent=2)
                 if self.cfg.yaml_cfg.get('sber_evaluation_metrics', False):
                     names = ('AP', 'AP50', 'AP75', 'APs', 'APm', 'APl', 'AR100', 'AR75')
+                    scale_aware = getattr(dist_utils.de_parallel(module).decoder, 'sber_scale_aware', False)
+                    if scale_aware:
+                        names = ('AP', 'AP50', 'AP75', 'APs', 'APm', 'APl', 'AR100', 'ARs', 'AR75')
                     focused = {name: metrics[name] for name in names}
                     focused.update(
                         config=self.cfg.yaml_cfg, checkpoint=self.cfg.resume,
                         weights='ema' if self.ema else 'model',
                         gpu_process_count=dist_utils.get_world_size(),
                         AR75_definition='COCO recall at IoU=0.75, area=all, maxDets=100; mean over valid categories')
-                    with (self.output_dir / 'sber_metrics.json').open('w', encoding='utf-8') as file:
+                    filename = 'sber_scale_metrics.json' if scale_aware else 'sber_metrics.json'
+                    if scale_aware:
+                        focused['sber_bypass'] = 'current reference normalized w*h > 0.0225; threshold fixed'
+                    with (self.output_dir / filename).open('w', encoding='utf-8') as file:
                         json.dump(focused, file, indent=2)
                     print('SBER evaluation:', {name: focused[name] for name in names})
                 if self.cfg.yaml_cfg.get('umqr_evaluation_metrics', False):
