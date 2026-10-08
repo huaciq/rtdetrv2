@@ -1,0 +1,20 @@
+# Diagnostic protocol fixed before seeing results. No training changes.
+seed: 0
+primary_quantile: 0.8
+evidence_quantiles: [0.7, 0.8, 0.9]
+ring_outer_scale: 2.0
+ring_guard_scale: 1.2
+minimum_background_pixels: 64
+minimum_foreground_pixels: 4
+minimum_evidence_pixels: 3
+robust_noise_floor_fraction: 0.001
+primary_score: 0.3
+score_thresholds: [0.05, 0.3, 0.5]
+match_iou: 0.5
+precise_iou: 0.75
+background_max_iou: 0.1
+source_field: null  # Set only if the COCO image metadata actually supplies sensor/source.
+bootstrap_repetitions: 500
+minimum_association_objects: 30
+minimum_association_images: 20
+minimum_bin_objects: 10
