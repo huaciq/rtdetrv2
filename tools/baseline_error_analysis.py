@@ -8,6 +8,7 @@ import copy
 import contextlib
 import csv
 import hashlib
+import importlib
 import importlib.metadata
 import json
 import io
@@ -30,6 +31,31 @@ ERRORS = ("Cls", "Loc", "Both", "Dupe", "Bkg", "Miss")
 METRICS = ("AP", "AP50", "AP75", "APs", "APm", "APl", "AR1", "AR10",
            "AR100", "ARs", "ARm", "ARl")
 HIGH_SCORE = 0.5
+
+
+def check_dependencies():
+    """Fail before inference/output writes, not after the complete GPU export."""
+    versions = {}
+    for name in ("torch", "faster-coco-eval", "tidecv", "numpy", "Pillow"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError as error:
+            raise RuntimeError(
+                f"Analysis dependency '{name}' has no installation metadata in {sys.executable}. "
+                "Activate rtdetr_zxy and install the analysis dependencies using this interpreter "
+                "(see BASELINE_ERROR_ANALYSIS.md). If predictions.json already exists, "
+                "recover with --predictions; GPU inference does not need to be repeated."
+            ) from error
+    try:
+        importlib.import_module("tidecv")
+        importlib.import_module("tidecv.data")
+        importlib.import_module("faster_coco_eval")
+    except ImportError as error:
+        raise RuntimeError(
+            f"An analysis dependency cannot be imported in {sys.executable}: {error}. "
+            "Fix the analysis installation before running inference; see BASELINE_ERROR_ANALYSIS.md."
+        ) from error
+    return versions
 
 
 def dump(path, value):
@@ -533,6 +559,7 @@ def report(metrics, tide, rows, gt_rows, counts, manifest, out):
 
 
 def analyze(args, predictions, metadata):
+    versions = check_dependencies()
     out = Path(args.output)
     gt = json.loads(Path(args.annotations).read_text(encoding="utf-8"))
     images, cats = preflight(gt, predictions, args.images)
@@ -543,7 +570,7 @@ def analyze(args, predictions, metadata):
                     annotations_sha256=sha(args.annotations), predictions_sha256=sha(out / "predictions.json"),
                     git_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                     utc=datetime.now(timezone.utc).isoformat(), high_confidence_score=HIGH_SCORE,
-                    versions={name: importlib.metadata.version(name) for name in ("torch", "faster-coco-eval", "tidecv", "numpy", "Pillow")})
+                    versions=versions)
     dump(out / "analysis_manifest.json", manifest)
     metrics, matches, missed = coco_evaluate(out / "validation_gt.json", predictions, out)
     tide = tide_evaluate(gt, predictions, out)
@@ -571,6 +598,7 @@ def main():
     rank = int(os.environ.get("RANK", 0))
     if args.predictions and int(os.environ.get("WORLD_SIZE", 1)) != 1:
         parser.error("Offline CPU analysis must be launched with python, not torchrun")
+    check_dependencies()
     out = Path(args.output)
     if rank == 0:
         out.mkdir(parents=True, exist_ok=True)

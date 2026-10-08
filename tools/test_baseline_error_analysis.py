@@ -13,6 +13,30 @@ import baseline_error_analysis as analysis
 
 
 class ErrorAnalysisTest(unittest.TestCase):
+    def test_missing_tide_metadata_stops_before_export_and_output_creation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "must_not_be_created"
+            original_version = analysis.importlib.metadata.version
+            def missing_tide(name):
+                if name == "tidecv":
+                    raise analysis.importlib.metadata.PackageNotFoundError(name)
+                return original_version(name)
+            argv = ["baseline_error_analysis.py", "--config", "unused.yml",
+                    "--checkpoint", "unused.pth", "--output", str(out)]
+            with mock.patch.object(analysis.sys, "argv", argv), \
+                    mock.patch.object(analysis.importlib.metadata, "version", side_effect=missing_tide), \
+                    mock.patch.object(analysis, "export") as export:
+                with self.assertRaisesRegex(RuntimeError, "tidecv.*installation metadata"):
+                    analysis.main()
+                export.assert_not_called()
+            self.assertFalse(out.exists())
+
+    def test_dependency_metadata_present_but_import_broken(self):
+        with mock.patch.object(analysis.importlib, "import_module",
+                               side_effect=ModuleNotFoundError("No module named 'appdirs'")):
+            with self.assertRaisesRegex(RuntimeError, "cannot be imported.*appdirs"):
+                analysis.check_dependencies()
+
     def test_baseline_export_strict_ema_and_original_postprocessor(self):
         import torch
         from src.core import YAMLConfig

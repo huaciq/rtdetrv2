@@ -28,6 +28,8 @@ python -c 'import torch, faster_coco_eval, pycocotools, tidecv; print(torch.__ve
 
 若服务器 worktree 有未提交修改，先检查；不要强制切换或 reset。TIDE 是离线分析依赖，不是模型模块；安装时约束现有核心依赖版本，避免改变 baseline 的数值环境。
 
+启动前工具会检查安装元数据和实际导入，缺少 `tidecv` 或其依赖时在 GPU 推理和结果目录创建之前失败。必须使用 `rtdetr_zxy` 环境里的 `python -m pip`，不能只在 `base` 环境安装。
+
 ## 固定流程启动（两张 GPU，只有一次推理）
 
 baseline 配置目前记录的验证路径是：
@@ -105,11 +107,15 @@ python -m json.tool "$OUT/tide_summary.json"
 
 若 CPU 分析中断但完整 `predictions.json` 已导出，只分析现有预测，不再跑模型，使用新的结果目录：
 
+若日志报 `PackageNotFoundError: tidecv`，先执行上面的依赖安装和导入检查。原调用会在版本记录失败前保存 `predictions.json`、`export_metadata.json` 和 `validation_gt.json`；保留整个原目录。`tail -f` 和 `watch` 都会持续占用终端，按 Ctrl+C 退出监控再输入恢复命令，不要把这些持续监控命令与恢复命令整段连续粘贴。
+
 ```bash
 cd /home/zxy/sar/repos/rtdetrv2_pytorch
 conda activate rtdetr_zxy
 OUT=/data2/zxy/sar/experiments/ogsod_rtdetrv2_r18_baseline_error_analysis_best
 RECOVERY=/data2/zxy/sar/experiments/ogsod_rtdetrv2_r18_baseline_error_analysis_best_recovery
+test -s "$OUT/predictions.json" || { echo '完整预测文件不存在，请先检查原输出'; exit 1; }
+test -s "$OUT/validation_gt.json" || { echo '验证 GT 副本不存在，请先检查原输出'; exit 1; }
 test ! -e "$RECOVERY" || { echo '恢复结果目录已存在，请先检查'; exit 1; }
 mkdir -p "$RECOVERY"
 nohup python tools/baseline_error_analysis.py \
@@ -131,6 +137,6 @@ conda run -n pytorch python -X utf8=0 -m py_compile tools/baseline_error_analysi
 conda run -n pytorch python -X utf8=0 tools/test_baseline_error_analysis.py
 ```
 
-检查严格 EMA 加载、两张合成图的原 baseline 300输出/图、六类错误、COCO one-to-one、crowd、.5/.75区分、空预测与未定义的 oracle、每组20例及裁剪。合成数据和临时 checkpoint 全部位于系统临时目录，不进入 Git。
+检查依赖缺失提前失败、严格 EMA 加载、两张合成图的原 baseline 300输出/图、六类错误、COCO one-to-one、crowd、.5/.75区分、空预测与未定义的 oracle、每组20例及裁剪。合成数据和临时 checkpoint 全部位于系统临时目录，不进入 Git。
 
 自动报告按独立 oracle 的最大项及 small 覆盖给出保守方向建议。TIDE Miss 不等于 COCO 全部 FN，漏检不自动证明需要知识迁移；背景 FP 也可能对应未标注目标。典型图需要人工核对后，才可把“与 GT 不重叠”解释为真实 SAR 杂波混淆。单 checkpoint 不能提供 teacher、监督方式或因果机制的对照证据。
