@@ -135,8 +135,67 @@ class PackageTests(unittest.TestCase):
             truth = bundle.read_json(path)
             truth["annotations"][0]["bbox"][0] += 1
             bundle.dump(path, truth)
-            with self.assertRaisesRegex(ValueError, "Original validation GT differs"):
+            with self.assertRaisesRegex(ValueError, "Original validation GT content differs"):
                 bundle.package(args)
+
+    def test_same_gt_different_json_bytes_resolves_p1_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args, _ = fixture(root)
+            gt_copy = Path(args.analysis)/"validation_gt.json"
+            truth = bundle.read_json(gt_copy)
+            # Recovery may hash this export copy, P1 hashes original val.json.
+            gt_copy.write_text(json.dumps(truth, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+            previous_path = Path(args.analysis)/"analysis_manifest.json"
+            previous = bundle.read_json(previous_path)
+            previous.update(annotations_source=str(gt_copy), annotations_sha256=bundle.sha(gt_copy))
+            bundle.dump(previous_path, previous)
+            base_cfg = root/"base.yml"
+            base_cfg.write_text(json.dumps({"val_dataloader": {"dataset": {"ann_file": "wrong.json"}}}), encoding="utf-8")
+            config = root/"p1.yml"
+            config.write_text(json.dumps({"__include__": ["base.yml"], "val_dataloader": {
+                "dataset": {"ann_file": str(root/"original_validation.json")}}}), encoding="utf-8")
+            provenance_path = Path(args.diagnosis)/"provenance.json"
+            provenance = bundle.read_json(provenance_path)
+            provenance.update(config=str(config), config_file_sha256=bundle.sha(config))
+            bundle.dump(provenance_path, provenance)
+            self.assertNotEqual(provenance["validation_sha256"], previous["annotations_sha256"])
+            manifest = bundle.package(args)
+            verified = manifest["validation_gt_verification"]
+            self.assertFalse(verified["same_recorded_byte_sha"])
+            self.assertTrue(verified["P1_and_analysis_content_equal"])
+            self.assertTrue(verified["Original_source_verified"] and verified["P1_source_verified"])
+
+    def test_different_p1_gt_still_rejected_even_with_valid_source_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args, _ = fixture(root)
+            truth = bundle.read_json(Path(args.analysis)/"validation_gt.json")
+            different = bundle.read_json(root/"original_validation.json")
+            different["annotations"][0]["bbox"][0] += 1
+            bundle.dump(root/"different_p1.json", different)
+            provenance = bundle.read_json(Path(args.diagnosis)/"provenance.json")
+            provenance["validation_sha256"] = bundle.sha(root/"different_p1.json")
+            previous = bundle.read_json(Path(args.analysis)/"analysis_manifest.json")
+            with self.assertRaisesRegex(ValueError, "P1 validation GT content differs"):
+                bundle.verify_validation_gt(truth, Path(args.analysis)/"validation_gt.json", provenance, previous, root/"different_p1.json")
+
+    def test_missing_p1_config_requires_hash_verified_relocated_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args, _ = fixture(root)
+            path = Path(args.analysis)/"validation_gt.json"
+            truth = bundle.read_json(path)
+            path.write_text(json.dumps(truth, sort_keys=True), encoding="utf-8")
+            previous = bundle.read_json(Path(args.analysis)/"analysis_manifest.json")
+            previous.update(annotations_source=str(path), annotations_sha256=bundle.sha(path))
+            provenance = bundle.read_json(Path(args.diagnosis)/"provenance.json")
+            with self.assertRaisesRegex(FileNotFoundError, "P1 config is unavailable"):
+                bundle.verify_validation_gt(truth, path, provenance, previous)
+            result = bundle.verify_validation_gt(truth, path, provenance, previous, root/"original_validation.json")
+            self.assertTrue(result["P1_and_analysis_content_equal"])
+            with self.assertRaisesRegex(ValueError, "P1 GT source byte hash changed"):
+                bundle.verify_validation_gt(truth, path, provenance, previous, path)
 
     def test_insufficient_unique_images_and_shared_groups_not_duplicated(self):
         rows = [{"center_group": group, "category_name": "Storage Tank", "image_id": iid,

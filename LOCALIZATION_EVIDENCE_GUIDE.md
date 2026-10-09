@@ -318,7 +318,7 @@ if mkdir "$OUT"; then
 fi
 ```
 
-仅需要已有Pillow与Python标准库，无新依赖。无checkpoint、GPU、TensorBoard或训练恢复操作。输出目录/ZIP已存在时拒绝覆盖。
+使用现有P1环境，无新依赖。GT字节哈希不同的情况下会复用P1的配置解析，无模型构建。无checkpoint、GPU、TensorBoard或训练恢复操作。输出目录/ZIP已存在时拒绝覆盖。
 
 监控与实际数量：
 
@@ -345,3 +345,32 @@ sha256sum "$OUT.zip"
 旧图若已丢失，仍根据原图/GT/真实预测重建新视图，并在逐例记录中标记旧可视化缺失。FN75若无TP50匹配，则保留旧分析的同类覆盖框，明确标记coverage_not_TP，不能误称为匹配检测。
 
 目前仅本地合成打包测试通过，服务器实际选取数量与图像尚未读取。人工视觉原因不因打包而变为已验证。失败后查看console，修正来源并将OUT改为新 `_retry1` 目录重跑同一命令；没有训练resume或重新推理。既有目录和ZIP保留。
+
+### GT哈希误判修复
+
+旧版 `P1/error-analysis validation split differs` 只表示两个字节SHA不同，不能直接据此判定split不同：P1的 `validation_sha256` 来源是配置中的原val.json，恢复分析的 `annotations_sha256` 可以来源于重新序列化的export GT副本。
+
+修复后分别检查每个来源文件与其自身记录的字节SHA，再比较解析后的完整GT（images、categories、annotations及其它字段；忽略JSON空白/对象键顺序，保留数组顺序与字段值）。真实GT差异、来源文件改变、预测SHA不匹配仍拒绝，不提供跳过校验开关。结果保存在 `manifest.json.validation_gt_verification`。
+
+9项合成测试通过，包括“GT格式不同但内容相同”成功打包、不同P1标注仍拒绝、原P1配置无法读取时需提供有哈希依据的原标注副本。更新第3节Git分支后，用新目录重试，保留失败日志：
+
+```bash
+cd /home/zxy/sar/repos/rtdetrv2_pytorch
+conda activate rtdetr_zxy
+DIAG=/data2/zxy/sar/experiments/ogsod_baseline_localization_diagnosis_best
+ANALYSIS=/data2/zxy/sar/experiments/ogsod_rtdetrv2_r18_baseline_error_analysis_best_recovery_mirror
+OUT=/data2/zxy/sar/experiments/ogsod_baseline_localization_cases_center20_retry1
+IMAGES=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["images_root"])' "$ANALYSIS/analysis_manifest.json")
+if mkdir "$OUT"; then
+  nohup python tools/package_localization_cases.py \
+    --diagnosis "$DIAG" --analysis "$ANALYSIS" --images "$IMAGES" \
+    --per-group 10 --output "$OUT" > "$OUT/console.log" 2>&1 &
+  PACKAGE_PID=$!
+  echo "$PACKAGE_PID" | tee "$OUT/launcher.pid"
+  disown
+fi
+```
+
+如果P1记录的配置/原val.json已迁移，才增加 `--p1-annotations /home/zxy/sar/datasets/OGSOD-1.0/sar/RTDETR_COCO/val.json`（或真实的迁移后路径）。这个文件必须匹配P1记录的原字节SHA，不能指向另一split来绕过检查。通常无需增加，工具会自动解析P1原配置。
+
+监控命令沿用上一节的新OUT。新ZIP路径：`/data2/zxy/sar/experiments/ogsod_baseline_localization_cases_center20_retry1.zip`。不需要重新运行P1、推理或训练。如果仍报内容不同，保留报错中的来源路径并检查两个GT，不能手工修改provenance哈希使检查通过。

@@ -72,6 +72,66 @@ def center_group(before, after):
     return GROUPS[0] if after >= .75 else GROUPS[1]
 
 
+def verify_validation_gt(truth, gt_path, provenance, previous, p1_annotations=None):
+    """Compare GT content only after linking files to their own recorded byte SHA.
+
+    P1 hashes the configured original val.json; recovery can hash a re-serialized
+    export validation_gt.json. Those SHA values need not be equal. A mismatching
+    pair must be resolved to actual source files, never silently ignored.
+    """
+    analysis_sha = previous["annotations_sha256"]
+    p1_sha = provenance.get("validation_sha256")
+    original = Path(previous["annotations_source"])
+    result = {"analysis_recorded_sha256": analysis_sha, "P1_recorded_sha256": p1_sha,
+              "analysis_copy_sha256": sha(gt_path), "same_recorded_byte_sha": p1_sha == analysis_sha,
+              "content_comparison": "exact parsed JSON; object key order/formatting ignored; arrays/values preserved"}
+    def validate(path, expected, label):
+        actual = sha(path)
+        if actual != expected:
+            raise ValueError(f"{label} GT source byte hash changed: {path}; expected {expected}, actual {actual}")
+        if read_json(path) != truth:
+            raise ValueError(f"{label} validation GT content differs from analysis GT: {path}")
+        result[label+"_source"] = str(path)
+        result[label+"_source_verified"] = True
+    # The saved analysis copy can itself be a byte-identical source copy.
+    if original.is_file():
+        validate(original, analysis_sha, "Original")
+    elif result["analysis_copy_sha256"] == analysis_sha:
+        validate(gt_path, analysis_sha, "Original")
+    else:
+        raise FileNotFoundError(f"Cannot verify recorded error-analysis GT source: {original}; locate its byte-identical copy")
+    if not p1_sha:
+        if p1_annotations:
+            raise ValueError("P1 validation byte hash missing; cannot verify --p1-annotations")
+        result["P1_source_verified"] = False
+        return result
+    if p1_annotations:
+        validate(Path(p1_annotations).resolve(), p1_sha, "P1")
+    elif p1_sha == analysis_sha:
+        result["P1_source"] = result["Original_source"]
+        result["P1_source_verified"] = True
+    elif result["analysis_copy_sha256"] == p1_sha:
+        validate(gt_path, p1_sha, "P1")
+    else:
+        repo = Path(__file__).resolve().parents[1]
+        config = Path(provenance.get("config", ""))
+        config = config if config.is_absolute() else repo/config
+        if not config.is_file():
+            raise FileNotFoundError("Recorded GT hashes differ and P1 config is unavailable; provide --p1-annotations with the original P1 val.json")
+        expected_config_sha = provenance.get("config_file_sha256")
+        if expected_config_sha and sha(config) != expected_config_sha:
+            raise ValueError("P1 config bytes changed; provide --p1-annotations with its original val.json")
+        # Reuse the exact P1 include/override resolver; no model is built.
+        from localization_diagnosis import resolved_config
+        p1_path = Path(resolved_config(config)["val_dataloader"]["dataset"]["ann_file"])
+        p1_path = p1_path if p1_path.is_absolute() else repo/p1_path
+        if not p1_path.is_file():
+            raise FileNotFoundError(f"P1 original validation GT missing: {p1_path}; provide --p1-annotations with its byte-identical relocated copy")
+        validate(p1_path, p1_sha, "P1")
+    result["P1_and_analysis_content_equal"] = True
+    return result
+
+
 def select_focus(errors, indexed_ids, count):
     """Missing-index first, round-robin input-size bins; distinct images per group.
 
@@ -162,15 +222,12 @@ def package(args):
     if provenance.get("prediction_sha256") and provenance["prediction_sha256"] != prediction_sha:
         raise ValueError("P1 provenance prediction hash differs from provided predictions")
     analysis_manifest_path = analysis/"analysis_manifest.json"
+    gt_verification = {"status": "no_analysis_manifest"}
     if analysis_manifest_path.exists():
         previous = read_json(analysis_manifest_path)
         if previous["predictions_sha256"] != prediction_sha:
             raise ValueError("Error-analysis manifest prediction hash mismatch")
-        if provenance.get("validation_sha256") and provenance["validation_sha256"] != previous["annotations_sha256"]:
-            raise ValueError("P1/error-analysis validation split differs")
-        original_gt = Path(previous["annotations_source"])
-        if original_gt.is_file() and (sha(original_gt) != previous["annotations_sha256"] or read_json(original_gt) != truth):
-            raise ValueError("Original validation GT differs from analysis GT")
+        gt_verification = verify_validation_gt(truth, gt_path, provenance, previous, getattr(args, "p1_annotations", None))
     images = {r["id"]: r for r in truth["images"]}
     gts = {r["id"]: r for r in truth["annotations"]}
     cats = {r["id"]: r["name"] for r in truth["categories"]}
@@ -315,6 +372,7 @@ def package(args):
         "input_sha256": {"example_index": sha(index_path), "matched_box_errors": sha(errors_path),
                          "full_predictions": prediction_sha, "full_validation_gt": sha(gt_path)},
         "P1_provenance_available": bool(provenance), "manual_review": "pending",
+        "validation_gt_verification": gt_verification,
         "diagnosis_source": str(diag), "analysis_source": str(analysis), "images_source": str(image_root),
         "packager_script_sha256": sha(__file__),
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], text=True).strip()}
@@ -354,6 +412,7 @@ def main():
     parser.add_argument("--images", required=True, help="Original validation image root")
     parser.add_argument("--output", required=True, help="Fresh directory; ZIP is written beside it")
     parser.add_argument("--per-group", type=int, default=10)
+    parser.add_argument("--p1-annotations", help="Optional relocated original P1 val.json; must match P1's recorded byte SHA")
     package(parser.parse_args())
 
 
