@@ -274,3 +274,74 @@ disown
 目前实际答案均待服务器数据与图像复核：主要中心/尺度/长宽比误差看逐类oracle gain/恢复75率及有符号边界偏移；极小集中性看条件FN75比例、AP75/AR75和样本量；高分辨率仅能形成假设，不能因小目标低IoU就判定有效；D-FINE优势看同预算新pilot；论文切入点还要排除标注问题。`manual_review.csv` 未填写证据前，不报告散射偏移、模糊边界或标签质量作为确定原因。
 
 执行P1后提供 `LOCALIZATION_DIAGNOSIS.md`、`provenance.json`、分类统计、逐框误差和原图/GT/典型图，才能在本地完成数值判断与人工复核。只返回文件路径不足以读取服务器内容。先提交和运行这些证据工具，不增加网络模块、不改baseline、不自动扩展实验。
+
+## 10. 补齐案例并生成便携ZIP（2026-10-09）
+
+新增 `tools/package_localization_cases.py` 与 `tools/test_package_localization_cases.py`。这是读取既有CSV/预测/GT的CPU打包工具，不运行模型、不训练、不重新评估、不改原案例索引。
+
+保留 `example_index.csv` 全部案例，再优先从未列入索引的Storage Tank GT中补选两组，各目标10张：
+
+- `center_recovers75`：原IoU在[.5,.75)，仅平移预测中心到GT中心，保持预测宽高，IoU恢复到≥.75。
+- `center_insufficient75`：同一原IoU范围，修正中心后仍<.75。这不代表中心修正完全没有增益；CSV/逐例JSON保留数值。
+
+组内image_id不重复；优先组间也不重复，若必要可选择同图的不同GT，两组共享图ID记录在manifest中。不按最大增益排序，按输入短边bin轮转并用image_id/gt_id确定顺序。候选不足时报告实际数量，不重复补足。来源预测SHA与P1/旧分析manifest核对，逐框重新计算IoU/center oracle并验证prediction_id、image_id、category和GT bbox。
+
+已完成6项合成测试：两组各10例、索引外补选、原图字节保留、旧FN跨目录图片及crop复制、ZIP逐文件hash/CRC验证、预测/GT来源不一致拒绝、唯一图不足不重复。可重跑：
+
+```powershell
+conda run -n pytorch python -X utf8=0 tools/test_package_localization_cases.py
+conda run -n pytorch python -X utf8=0 -m py_compile tools/package_localization_cases.py tools/test_package_localization_cases.py
+```
+
+服务器先更新本指南第3节的同一Git分支，再执行下面命令。`DIAG` 是上一轮默认P1输出目录；如果实际运行使用了 `_retry1` 等目录，仅替换 `DIAG` 为真正包含两份CSV的目录。
+
+```bash
+cd /home/zxy/sar/repos/rtdetrv2_pytorch
+conda activate rtdetr_zxy
+DIAG=/data2/zxy/sar/experiments/ogsod_baseline_localization_diagnosis_best
+ANALYSIS=/data2/zxy/sar/experiments/ogsod_rtdetrv2_r18_baseline_error_analysis_best_recovery_mirror
+OUT=/data2/zxy/sar/experiments/ogsod_baseline_localization_cases_center20
+IMAGES=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["images_root"])' "$ANALYSIS/analysis_manifest.json")
+test -r "$DIAG/example_index.csv"
+test -r "$DIAG/matched_box_errors.csv"
+test -d "$IMAGES"
+df -h /data2/zxy/sar/experiments
+python -c 'from PIL import Image'
+if mkdir "$OUT"; then
+  nohup python tools/package_localization_cases.py \
+    --diagnosis "$DIAG" --analysis "$ANALYSIS" \
+    --images "$IMAGES" \
+    --per-group 10 --output "$OUT" > "$OUT/console.log" 2>&1 &
+  PACKAGE_PID=$!
+  echo "$PACKAGE_PID" | tee "$OUT/launcher.pid"
+  disown
+fi
+```
+
+仅需要已有Pillow与Python标准库，无新依赖。无checkpoint、GPU、TensorBoard或训练恢复操作。输出目录/ZIP已存在时拒绝覆盖。
+
+监控与实际数量：
+
+```bash
+tail -n 80 "$OUT/console.log"
+ps -fp "$(cat "$OUT/launcher.pid")"
+python -m json.tool "$OUT/COMPLETE.json"
+python -m json.tool "$OUT/manifest.json"
+ls -lh "$OUT.zip"
+sha256sum "$OUT.zip"
+```
+
+下载单个文件：`/data2/zxy/sar/experiments/ogsod_baseline_localization_cases_center20.zip`。包内：
+
+- `images/`：原图逐字节复制，文件名编码原image_id，原文件名和hash另行记录。
+- `case_index.csv`：全部案例的相对路径、原image_id/GT id/prediction_id、修正前后IoU。
+- `storage_tank_center_cases.csv`：两组重点案例及是否新增到原索引。
+- `cases/GT_ID/`：真实框叠加图、中心oracle对比裁剪图、原索引引用的旧图/crop（若仍存在）、完整 `record.json`。青框只是GT-center oracle，不能当模型预测；GT绿色，真实预测红色。
+- `validation_gt.json`、`predictions.json`：所选图像全部GT与全部预测，保留原ID、bbox、score/category；原COCO file_name不改，原图在包中的路径通过case_index映射。
+- `prediction_index.csv`：子集行号与原始全量prediction_id映射。
+- `source/`：原索引、误差表、provenance/旧分析manifest、已有人工复核表；原文件不修改。
+- `manifest.json`、`file_manifest.json`、`README.md`：数量、选择规则、来源SHA和包内文件SHA。`COMPLETE.json`位于服务器输出目录，记录ZIP SHA；ZIP内manifest记录完成状态。
+
+旧图若已丢失，仍根据原图/GT/真实预测重建新视图，并在逐例记录中标记旧可视化缺失。FN75若无TP50匹配，则保留旧分析的同类覆盖框，明确标记coverage_not_TP，不能误称为匹配检测。
+
+目前仅本地合成打包测试通过，服务器实际选取数量与图像尚未读取。人工视觉原因不因打包而变为已验证。失败后查看console，修正来源并将OUT改为新 `_retry1` 目录重跑同一命令；没有训练resume或重新推理。既有目录和ZIP保留。
