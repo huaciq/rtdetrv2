@@ -374,3 +374,71 @@ fi
 如果P1记录的配置/原val.json已迁移，才增加 `--p1-annotations /home/zxy/sar/datasets/OGSOD-1.0/sar/RTDETR_COCO/val.json`（或真实的迁移后路径）。这个文件必须匹配P1记录的原字节SHA，不能指向另一split来绕过检查。通常无需增加，工具会自动解析P1原配置。
 
 监控命令沿用上一节的新OUT。新ZIP路径：`/data2/zxy/sar/experiments/ogsod_baseline_localization_cases_center20_retry1.zip`。不需要重新运行P1、推理或训练。如果仍报内容不同，保留报错中的来源路径并检查两个GT，不能手工修改provenance哈希使检查通过。
+
+## 11. 一次只读检测错误结构分析（2026-10-12）
+
+`tools/error_structure_analysis.py`复用`baseline_error_analysis.coco_evaluate`与其标准COCO匹配和几何工具。读取旧完整预测/GT；不构建模型、不重新推理、不训练、不需要TIDE。新增测试`tools/test_error_structure_analysis.py`，原模型、配置和评估脚本不修改。
+
+主统计固定score≥0.5、IoU=.50，补充IoU=.75及all_scores，COCO maxDets=100/图/类别。全分数统计也是该COCO截断范围，不是把300导出框全部算作正式检测。crowd/ignored排除。
+
+FP标签是与现有标注的关系：Bkg=全部非crowd GT最大IoU<.1，Cls=强异类重叠且无强同类重叠，Loc=同类弱重叠且无强异类重叠，Dupe=强同类GT已被另一个预测匹配。Both与Unresolved单列，不能强行归为背景或定位。这些计数不是TIDE dAP，不能解释为SAR成像机制。
+
+更新第3节Git分支后执行以下代码，CPU运行、输出新目录。图片根目录从真实旧分析manifest读取。可用时链接原GPU导出元数据；原导出已删除时仍可计算错误结构，但报告明确baseline导出关联未验证，不凭目录名补造checkpoint证明。
+
+```bash
+cd /home/zxy/sar/repos/rtdetrv2_pytorch
+conda activate rtdetr_zxy
+ANALYSIS=/data2/zxy/sar/experiments/ogsod_rtdetrv2_r18_baseline_error_analysis_best_recovery_mirror
+SRC=/data2/zxy/sar/experiments/ogsod_rtdetrv2_r18_baseline_error_analysis_best
+OUT=/data2/zxy/sar/experiments/ogsod_baseline_error_structure_20261012
+IMAGES=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["images_root"])' "$ANALYSIS/analysis_manifest.json")
+EXTRA_ARGS=()
+if [ -r "$SRC/export_metadata.json" ] && [ -r "$SRC/predictions.json" ]; then
+  EXTRA_ARGS=(--export-dir "$SRC")
+fi
+python -c 'import numpy, PIL, pycocotools, faster_coco_eval'
+df -h /data2/zxy/sar/experiments
+if mkdir "$OUT"; then
+  nohup python tools/error_structure_analysis.py \
+    --analysis "$ANALYSIS" --images "$IMAGES" --output "$OUT" \
+    "${EXTRA_ARGS[@]}" > "$OUT/console.log" 2>&1 &
+  ANALYSIS_PID=$!
+  echo "$ANALYSIS_PID" | tee "$OUT/launcher.pid"
+  disown
+fi
+```
+
+需要既有环境中的numpy/Pillow/pycocotools/faster-coco-eval，无需安装新依赖。输入丢失、哈希不一致或场景/复核映射无效时停止；不能用选取案例包的预测子集替代全验证集。
+
+```bash
+tail -n 80 "$OUT/console.log"
+ps -fp "$(cat "$OUT/launcher.pid")"
+python -m json.tool "$OUT/COMPLETE.json"
+cat "$OUT/ERROR_STRUCTURE_REPORT.md"
+```
+
+输出：
+
+- `ERROR_STRUCTURE_REPORT.md`：每类别TP/FP/FN、FP类型、前10%错误图集中度、场景覆盖、漏标复核状态和证据限制。
+- `class_statistics.csv`、`class_size_statistics.csv`：分类别、尺度、IoU=.50/.75、置信度口径计数；TP/FN采用GT类别/尺寸，FP采用预测类别与明确关联GT尺寸（Bkg采用预测面积），不能混淆分母。
+- `fp_distribution_summary.csv`、`fp_histograms.csv`：FP置信度、同类IoU和任意类别IoU均值/中位数/P90及固定分箱。
+- `image_statistics.csv`、`scene_statistics.csv`：逐图暴露量与明确scene_id/scene_type分组的FP/图、FN/GT。无标签时scene表只保留表头，报告标记缺证据，不猜场景。
+- `high_confidence_detection_details.csv`、`gt_detection_details.csv`：原始image_id/prediction_id/GT id、匹配/复核状态、尺度依据。
+- `visualizations/{Bkg,Cls,Loc,Dupe,Both,Unresolved,FN}/`：每类型最多20例，按score优先与类别/尺度轮转，同类型图像不重复；附保持比例的裁剪图。
+- `visualization_index.csv`、`background_review.csv`：背景候选人工复核模板，绑定原始全量prediction_id与预测SHA。
+- `coco_metrics.json`、`analysis_manifest.json`、`COMPLETE.json`：保留原COCO数值、来源与完成标记；自动脚本不声称完成视觉机制复核。
+
+如已有可靠场景资料，添加 `--scene-map /path/to/scene_map.csv`；列为 `image_id,scene_id,scene_type`，允许部分覆盖。也读取GT images中显式同名字段，不从文件名/类别推断场景。
+
+如已有人工复核，把旧输出`background_review.csv`复制到独立位置后填写，再用新输出目录与 `--reviews /path/to/reviews.csv` 重读同一预测即可。允许的状态：pending、suspected_missing_annotation、confirmed_missing_annotation、confirmed_background、uncertain。非pending项必须填写reviewer和evidence，预测SHA和image_id必须对应，拒绝混用其它导出。原GT/预测及正式COCO AP不修改，疑似/确认漏标在证据统计单列，不直接称为真实背景误检。0条记录不是“没有漏标”的证据。
+
+没有checkpoint、GPU、TensorBoard或训练resume。失败后检查日志与来源，改为新 `_retry1` OUT重跑本命令，保留旧输出。没有场景资料/复核记录时仍能完成标注协议下数值统计，但报告分别注明未评估；不能将普通检测错误解释为SAR成像机制。
+
+本地验证：
+
+```powershell
+conda run -n pytorch python -X utf8=0 tools/test_error_structure_analysis.py
+conda run -n pytorch python -X utf8=0 -m py_compile tools/error_structure_analysis.py tools/test_error_structure_analysis.py
+```
+
+6项合成测试已通过：TP/FP/FN和高/低置信度分离、crowd忽略、漏标单列且不改正式FP、场景部分覆盖、分类混淆优先级与重复检测依据、空预测全漏检及只读输入/案例输出，预测哈希变化及非baseline导出拒绝。未运行服务器真实数据。
